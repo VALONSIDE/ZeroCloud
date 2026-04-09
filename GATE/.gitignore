@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
+frontend/node_modules/
+
+backend/data/events.json
+backend/data/profile.json
+backend/data/kits.json
