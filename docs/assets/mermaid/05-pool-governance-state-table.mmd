@@ -1,0 +1,87 @@
+%%{init: {'theme': 'base', 'themeVariables': { 'fontFamily': 'Courier New', 'fontSize': '16px', 'primaryColor': '#fff'}}}%%
+flowchart LR
+    %% 样式定义：直角、黑白、技术手册风格
+    classDef main_box fill:#fff,stroke:#000,stroke-width:2px,rx:0px,ry:0px,font-weight:bold;
+    classDef sub_box fill:#f4f4f4,stroke:#000,stroke-width:1px,rx:0px,ry:0px;
+    classDef data_json fill:#e0e0e0,stroke:#000,stroke-width:1px,rx:0px,ry:0px;
+    classDef data_str fill:#fff,stroke:#000,stroke-width:1px,rx:0px,ry:0px,stroke-dasharray:2 2;
+    classDef group_box fill:none,stroke:#000,stroke-width:1px,rx:0px,ry:0px,stroke-dasharray:4 4;
+
+    %% 根节点：POOL STATE TABLE
+    STATE_ROOT[("POOL_STATE_TABLE<br/>SINGLE SOURCE OF TRUTH")]:::main_box
+
+    %% === 1. 静态配置层 ===
+    subgraph PROFILE_BLOCK ["PROFILE CONFIGURATION (Read-Only)"]
+        class PROFILE_BLOCK group_box;
+        direction TB
+        P1["pool_id: 'POOL_HALL_A'"]:::data_str
+        P2["gate_id: 'GATE_01'"]:::data_str
+        P3["pool_name: 'Immersive Hall'"]:::data_str
+        P4["gate_name: 'Master Node'"]:::data_str
+    end
+
+    %% === 2. 动态发现与待处理 ===
+    subgraph DYNAMIC_POOL ["DISCOVERY AND PENDING"]
+        class DYNAMIC_POOL group_box;
+        direction TB
+        DISC["discovered_pools (Array)<br/>[{'pool_id', 'gate_id', 'rssi'}]"]:::data_json
+        PEND["pending_kits (Map)<br/>Key: UID"]:::data_json
+        subgraph PENDING_DETAIL ["Pending Item Structure"]
+            PD1["uid: '001122334455'"]:::data_str
+            PD2["pending_pool_id: 'POOL_ZC'"]:::data_str
+            PD3["timestamp: 1712345678"]:::data_str
+            PD4["skills: ['SKILL_TEMP', ...]"]:::data_json
+        end
+        PEND --- PD1
+    end
+
+    %% === 3. 活跃设备层 ===
+    subgraph KITS_BLOCK ["ACTIVE KITS REGISTRY"]
+        class KITS_BLOCK group_box;
+        direction TB
+        KITS["kits (Map)<br/>Key: KIT_ID"]:::data_json
+        
+        subgraph KIT_ITEM ["KIT State Object"]
+            direction LR
+            K_ID["kit_id: 'KIT_A1'"]:::data_str
+            K_STATUS["status: 'ONLINE'"]:::data_str
+            K_LAST["last_seen: 1712345678"]:::data_str
+            K_SKILLS["skills: {'SKILL_TEMP': {'value': 25.5}}"]:::data_json
+        end
+        KITS --- K_ID
+    end
+
+    %% === 4. 规则与事件层 ===
+    subgraph EVENTS_BLOCK ["EVENT RULES AND ENGINE"]
+        class EVENTS_BLOCK group_box;
+        direction TB
+        EVENTS["events (Map)<br/>Key: EVENT_ID"]:::data_json
+        
+        subgraph EVENT_RULE ["Rule Structure"]
+            direction LR
+            E_ID["id: 'TEMP_ALERT'"]:::data_str
+            E_ENABLED["enabled: true"]:::data_str
+            E_MODE["mode: 'form' | 'code'"]:::data_str
+            E_LOGIC["logic: {...}"]:::data_json
+            E_ACTION["action: {'target_kit', 'target_skill', 'payload'}"]:::data_json
+        end
+        EVENTS --- E_ID
+    end
+
+    %% === 5. 错误与诊断 ===
+    subgraph ERRORS_BLOCK ["DIAGNOSTICS AND ERRORS"]
+        class ERRORS_BLOCK group_box;
+        ERRORS["error_map (Map)<br/>Key: COMPONENT"]:::data_json
+        subgraph ERR_ITEM ["Error Record"]
+            ERR_MSG["msg: 'SKILL_MISSING'"]:::data_str
+            ERR_TS["timestamp: ..."]:::data_str
+        end
+        ERRORS --- ERR_MSG
+    end
+
+    %% === 根连接 ===
+    STATE_ROOT === PROFILE_BLOCK
+    STATE_ROOT === DYNAMIC_POOL
+    STATE_ROOT === KITS_BLOCK
+    STATE_ROOT === EVENTS_BLOCK
+    STATE_ROOT === ERRORS_BLOCK

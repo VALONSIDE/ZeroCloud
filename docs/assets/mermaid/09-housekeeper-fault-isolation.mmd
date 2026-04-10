@@ -1,0 +1,79 @@
+%%{init: {'theme': 'base', 'themeVariables': { 'fontFamily': 'Courier New', 'fontSize': '16px', 'primaryColor': '#fff'}}}%%
+flowchart TD
+    %% 样式定义
+    classDef main fill:#fff,stroke:#000,stroke-width:2px,rx:0px,ry:0px,font-weight:bold;
+    classDef sub fill:#fff,stroke:#000,stroke-width:1px,rx:0px,ry:0px;
+    classDef phase fill:#e8e8e8,stroke:#000,stroke-width:2px,rx:0px,ry:0px;
+    classDef lock fill:#fff,stroke:#000,stroke-width:2px,rx:0px,ry:0px,stroke-dasharray:3 3;
+    classDef net fill:#fff,stroke:#000,stroke-width:1px,rx:0px,ry:0px,stroke-dasharray:2 2;
+    classDef warn fill:#fff,stroke:#f00,stroke-width:1px,rx:0px,ry:0px,color:#000;
+
+    %% === 守护线程入口 ===
+    subgraph HOUSEKEEPER ["HOUSEKEEPER DAEMON (1Hz CYCLE)"]
+        direction TB
+        
+        %% 1. LWT 监听分支 (被动)
+        subgraph LWT_LISTENER ["PASSIVE: LWT LISTENER"]
+            MQTT_LWT("MQTT LWT RECEIVED<br/>{KIT} STATUS: OFFLINE"):::net
+            LWT_PARSE["PARSE OFFLINE KIT"]:::sub
+            MQTT_LWT --> LWT_PARSE
+        end
+
+        %% 2. 定时扫描分支 (主动)
+        subgraph ACTIVE_SCAN ["ACTIVE: TIMEOUT SCANNER"]
+            SCAN_STATE["ITERATE ALL KITS<br/>READ STATE TABLE"]:::sub
+            CHECK_TS["CHECK last_seen TIMESTAMP"]:::phase
+            IS_TIMEOUT{"TIMEOUT > THRESHOLD?"}:::main
+            SCAN_STATE --> CHECK_TS --> IS_TIMEOUT
+        end
+
+        %% 3. 广播与发现 (周期性)
+        subgraph BROADCAST ["PERIODIC: DISCOVERY"]
+            BUILD_PROF["BUILD PROFILE MSG"]:::sub
+            PUB_ANN("PUB: SYS_GATE/PROFILE/ANNOUNCE<br/>(Pool/Gate Info)"):::net
+            BUILD_PROF --> PUB_ANN
+        end
+
+        %% 汇聚到离线确认
+        LWT_PARSE --> OFFLINE_CONFIRM["CONFIRM KIT OFFLINE<br/>(Status: OFFLINE)"]:::main
+        IS_TIMEOUT -- YES --> OFFLINE_CONFIRM
+    end
+
+    %% === 故障隔离与状态更新 ===
+    subgraph FAULT_ISOLATION ["FAULT ISOLATION & STATE UPDATE"]
+        direction TB
+
+        %% 动作 1: 规则锁定
+        subgraph RULE_LOCK ["RULE LOCKDOWN MECHANISM"]
+            FIND_RULES["IDENTIFY DEPENDENT EVENTS<br/>(Using Target KIT/SKILL)"]:::sub
+            LOCK_RULES["SET EVENT STATUS: LOCKED<br/>(Disable Execution)"]:::lock
+            FIND_RULES --> LOCK_RULES
+        end
+
+        %% 动作 2: 状态表写入
+        subgraph PERSIST_STATE ["PERSIST TO STATE TABLE"]
+            ACQ_LK["ACQUIRE MUTEX LOCK"]:::sub
+            UPDATE_KIT["WRITE KIT: STATUS=OFFLINE<br/>LAST_SEEN=NOW"]:::phase
+            UPDATE_RULES["WRITE EVENT: STATUS=LOCKED<br/>REASON=KIT_OFFLINE"]:::phase
+            REL_LK["RELEASE MUTEX LOCK"]:::sub
+            
+            ACQ_LK --> UPDATE_KIT --> UPDATE_RULES --> REL_LK
+        end
+        
+        %% 动作 3: 错误标记
+        subgraph ERROR_HANDLING ["DIAGNOSTIC MARKING"]
+            LOG_ERR["LOG: KIT LOST SIGNAL<br/>TRACE: LWT RECEIVED"]:::warn
+            PUSH_SSE["SSE PUSH TO FRONTEND<br/>(Visual Warning)"]:::sub
+        end
+    end
+
+    %% === 连线逻辑 ===
+    OFFLINE_CONFIRM --> FIND_RULES
+    OFFLINE_CONFIRM --> UPDATE_KIT
+    OFFLINE_CONFIRM --> LOG_ERR
+    
+    LOCK_RULES --> UPDATE_RULES
+    UPDATE_RULES --> PUSH_SSE
+    
+    %% 外部连接
+    MQTT_LWT ~~~ HOUSEKEEPER

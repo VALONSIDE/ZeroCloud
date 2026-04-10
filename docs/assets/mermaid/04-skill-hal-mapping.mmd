@@ -1,0 +1,67 @@
+%%{init: {'theme': 'base', 'themeVariables': { 'fontFamily': 'Arial', 'fontSize': '16px', 'primaryColor': '#fff'}}}%%
+flowchart TD
+    %% 样式定义
+    classDef mainBox fill:#fff,stroke:#000,stroke-width:2px,rx:0px,ry:0px,font-weight:bold;
+    classDef subBox fill:#fff,stroke:#000,stroke-width:1px,rx:0px,ry:0px;
+    classDef highlight fill:#e0e0e0,stroke:#000,stroke-width:2px,rx:0px,ry:0px;
+    classDef contract fill:#fff,stroke:#000,stroke-width:3px,rx:0px,ry:0px;
+    classDef code fill:#fff,stroke:#000,stroke-width:1px,rx:0px,ry:0px,font-family:'Courier New';
+
+    %% === 顶部：协议与业务层 ===
+    subgraph PROTOCOL_LAYER ["PROTOCOL & BUSINESS LAYER (AE-Link)"]
+        direction TB
+        
+        subgraph TOPIC ["TOPIC ROUTING"]
+            T1["POOL/GATE/KIT/SKILL_TEMP/REPORT"]:::code
+            T2["POOL/GATE/KIT/SKILL_DISPLAY/SET"]:::code
+        end
+        
+        subgraph PAYLOAD ["STANDARDIZED PAYLOAD"]
+            P1["{ 'value': 25.5 }"]:::code
+            P2["{ 'msg': 'WARN', 'dur': 5000 }"]:::code
+        end
+        
+        TOPIC --> PAYLOAD
+    end
+
+    %% === 中间：SKILL 抽象层 ===
+    subgraph SKILL_LAYER ["SKILL ABSTRACTION LAYER (The Contract)"]
+        direction LR
+        
+        subgraph INPUT_SKILL ["INPUT SKILLS (Sensors)"]
+            S_TEMP["SKILL_TEMP<br/>(Read Only)"]:::contract
+            S_PIR["SKILL_PIR<br/>(Read Only)"]:::contract
+        end
+        
+        subgraph OUTPUT_SKILL ["OUTPUT SKILLS (Actuators)"]
+            S_DISP["SKILL_DISPLAY<br/>(Read/Write)"]:::contract
+            S_RELAY["SKILL_RELAY<br/>(Write Only)"]:::contract
+        end
+    end
+
+    %% === 底部：硬件实现层 ===
+    subgraph HARDWARE_LAYER ["HARDWARE IMPLEMENTATION (Heterogeneous)"]
+        direction TB
+        
+        subgraph ESP_IMPL ["ESP32-C6 REFERENCE"]
+            H_DHT["DHT11 SENSOR<br/>(GPIO 4)"]:::subBox
+            H_OLED["I2C OLED 0.96'<br/>(SDA/SCL)"]:::subBox
+        end
+        
+        subgraph STM_IMPL ["STM32 / ARDUINO"]
+            H_SHT["SHT30 SENSOR<br/>(I2C)"]:::subBox
+            H_SERVO["SG90 SERVO<br/>(PWM PIN)"]:::subBox
+        end
+    end
+
+    %% === 映射关系 ===
+    %% 硬件 -> SKILL
+    H_DHT -.->|DRIVER MAP| S_TEMP
+    H_SHT -.->|DRIVER MAP| S_TEMP
+    
+    H_OLED -.->|DRIVER MAP| S_DISP
+    H_SERVO -.->|DRIVER MAP| S_RELAY
+
+    %% SKILL -> 协议
+    S_TEMP ==>|MAP TO| P1
+    S_DISP ==>|MAP TO| P2

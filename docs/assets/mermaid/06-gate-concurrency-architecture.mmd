@@ -1,0 +1,100 @@
+%%{init: {'theme': 'base', 'themeVariables': { 'fontFamily': 'Courier New', 'fontSize': '16px', 'primaryColor': '#fff'}}}%%
+flowchart TD
+    %% 样式定义
+    classDef core fill:#fff,stroke:#000,stroke-width:2px,rx:0px,ry:0px,font-weight:bold;
+    classDef module fill:#fff,stroke:#000,stroke-width:1px,rx:0px,ry:0px;
+    classDef storage fill:#f4f4f4,stroke:#000,stroke-width:2px,rx:0px,ry:0px,font-weight:bold;
+    classDef lock stroke:#000,stroke-width:3px,stroke-dasharray: 4 4;
+    classDef io fill:#fff,stroke:#000,stroke-width:1px,rx:0px,ry:0px,stroke-dasharray:2 2;
+    classDef error fill:#fff,stroke:#f00,stroke-width:1px,rx:0px,ry:0px,color:#f00;
+
+    subgraph GATE_ARCHITECTURE ["GATE CONCURRENT ARCHITECTURE (Python + FastAPI)"]
+        direction TB
+
+        %% === 左侧：异步消息层 ===
+        subgraph IO_LAYER ["ASYNC IO LAYER (MQTT Callback)"]
+            direction LR
+            
+            TOPIC_LIFECYCLE["LIFECYCLE<br/>PENDING/STATUS"]:::io
+            TOPIC_DATA["DATA<br/>SKILL_REPORT"]:::io
+            TOPIC_CTRL["CTRL<br/>ACTION_SET"]:::io
+            
+            DECODE["PACKET DECODER<br/>JSON Parse<br/>Topic Route"]:::module
+            WRITE_INTENT["WRITE INTENT<br/>Validate & Queue"]:::module
+
+            TOPIC_LIFECYCLE --> DECODE
+            TOPIC_DATA --> DECODE
+            TOPIC_CTRL --> DECODE
+            DECODE --> WRITE_INTENT
+        end
+
+        %% === 中间：数据与锁 ===
+        subgraph DATA_LAYER ["DATA & CONCURRENCY CONTROL"]
+            STATE_TABLE[("POOL STATE TABLE<br/>JSON Memory<br/>profile/kits/events/errors")]:::storage
+            LOCK{{"MUTEX LOCK<br/>threading.Lock()"}}:::lock
+            STATE_TABLE ---|"Protected Access"| LOCK
+        end
+
+        %% === 右侧：逻辑层 ===
+        subgraph LOGIC_LAYER ["LOGIC & DAEMON LAYER"]
+            direction TB
+            
+            subgraph FRAME_LOOP ["FRAME ENGINE (60Hz / 16.6ms)"]
+                direction TB
+                READ_SNAP["1. READ SNAPSHOT<br/>Lock & Copy State"]:::module
+                EVAL_RULES["2. EVALUATE EVENTS<br/>Form/Code Mode"]:::core
+                CHECK_COOL["3. CHECK COOLDOWN<br/>Rate Limiting"]:::module
+                EXEC_ACT["4. EXECUTE ACTION<br/>Publish CMD"]:::module
+                LOG_OUT["5. LOG & TRACE<br/>Error Marking"]:::module
+                
+                READ_SNAP --> EVAL_RULES
+                EVAL_RULES --> CHECK_COOL
+                CHECK_COOL --> EXEC_ACT
+                EXEC_ACT --> LOG_OUT
+            end
+            
+            subgraph HOUSE_LOOP ["HOUSEKEEPER (1Hz)"]
+                SCAN_OFFLINE["SCAN LWT/OFFLINE<br/>Timeout Check"]:::module
+                LOCK_RULES["LOCK RULES<br/>Disable if Offline"]:::module
+                ANNOUNCE["PROFILE ANNOUNCE<br/>GATE Discovery"]:::io
+                CLEANUP["CLEANUP PENDING<br/>Expired Requests"]:::module
+                
+                SCAN_OFFLINE --> LOCK_RULES
+                LOCK_RULES --> ANNOUNCE
+                ANNOUNCE --> CLEANUP
+            end
+        end
+
+        %% === 底部：API ===
+        subgraph API_LAYER ["MANAGEMENT API (FastAPI)"]
+            direction LR
+            FASTAPI["FASTAPI ENDPOINTS<br/>Config/Device/Event"]:::module
+            SSE["SSE PUSH STREAM<br/>Real-time State"]:::module
+            ERROR_LOG["ERROR LOG API<br/>Exception Query"]:::error
+            FASTAPI --> SSE
+            FASTAPI --> ERROR_LOG
+        end
+
+        %% === 核心连线 (修复语法) ===
+        WRITE_INTENT ==>|"WRITE + LOCK"| STATE_TABLE
+        
+        LOCK -->|"UNLOCK"| READ_SNAP
+        LOG_OUT -.->|"UPDATE STATE"| STATE_TABLE
+
+        STATE_TABLE ---|"READ"| SCAN_OFFLINE
+        CLEANUP -.->|"WRITE"| STATE_TABLE
+        STATE_TABLE -.-> ANNOUNCE
+
+        STATE_TABLE -.->|"READ ONLY"| FASTAPI
+        STATE_TABLE -.->|"STREAM"| SSE
+        
+        %% 外部输入输出
+        EXT_MQTT(("MQTT BROKER<br/>External")):::io
+        EXT_MQTT --> TOPIC_LIFECYCLE
+        EXT_MQTT --> TOPIC_DATA
+        EXT_MQTT --> TOPIC_CTRL
+        EXEC_ACT -.->|"PUB CMD"| EXT_MQTT
+        
+        %% 技术指标
+        METRICS["KEY METRICS:<br/>• Frame Rate: 60Hz (16.6ms)<br/>• Housekeeper: 1Hz<br/>• MQTT QoS: 1<br/>• SSE Update: Real-time"]:::module
+    end

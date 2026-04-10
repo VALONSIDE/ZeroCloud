@@ -75,7 +75,8 @@ python3 -m app.main
 
 ## 文档入口
 
-- 根目录总文档：`../ZeroCloud_Alpha_260409_Project_Manual.md`
+- 正式技术总手册：`docs/ZeroCloud_Alpha_260409_Project_Manual.md`
+- 根目录镜像手册：`../ZeroCloud_Alpha_260409_Project_Manual.md`
 - GATE 文档：`GATE/README.md`
 - KIT 文档：`KIT/ESP32-C6-Reference/README.md`
 

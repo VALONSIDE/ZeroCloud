@@ -1,0 +1,70 @@
+%%{init: {'theme': 'base', 'themeVariables': { 'fontFamily': 'Courier New', 'fontSize': '16px', 'primaryColor': '#fff'}}}%%
+flowchart TD
+    %% 样式定义：强制直角、黑白、加粗边框
+    classDef mainBox fill:#fff,stroke:#000,stroke-width:2px,rx:0px,ry:0px,font-weight:bold;
+    classDef subBox fill:#fff,stroke:#000,stroke-width:1px,rx:0px,ry:0px;
+    classDef highlight fill:#f4f4f4,stroke:#000,stroke-width:2px,rx:0px,ry:0px,font-weight:bold;
+    classDef external fill:#fff,stroke:#000,stroke-width:1px,rx:0px,ry:0px,stroke-dasharray:4 4;
+    classDef protocol fill:#fff,stroke:#000,stroke-width:1px,rx:0px,ry:0px,font-size:14px;
+
+    %% === 外部 MQTT Broker ===
+    MQTT_BROKER(("MQTT BROKER<br/>port:1883<br/>LAN/WLAN")):::mainBox
+
+    %% === 逻辑域：POOL ===
+    subgraph POOL_LOGIC ["POOL_HALL_A (逻辑域边界)"]
+        direction TB
+        
+        %% 前端控制台
+        ADMIN["ADMIN CONSOLE<br/>Vue3 + Tailwind<br/>HTTP/WS + SSE"]:::mainBox
+
+        %% === 边缘节点：GATE ===
+        subgraph GATE_PHYSICAL ["GATE_01 (边缘脑干)"]
+            direction TB
+            
+            API_L["API LAYER<br/>FastAPI + Uvicorn<br/>port:8000"]:::subBox
+            
+            STATE[("POOL STATE TABLE<br/>JSON Memory<br/>Single Source of Truth")]:::highlight
+
+            subgraph ENGINE_BLOCK ["COMPUTE BLOCK"]
+                direction LR
+                FE["FRAME ENGINE<br/>60Hz Loop<br/>Rule Evaluation"]:::highlight
+                HK["HOUSEKEEPER<br/>1Hz Scan<br/>Offline Detection"]:::subBox
+            end
+
+            subgraph PROTO_BLOCK ["PROTO BLOCK"]
+                MQTT_L["MQTT LISTENER<br/>Paho-Async<br/>Sub/Pub Handler"]:::subBox
+            end
+
+            %% 内部连接
+            API_L --- STATE
+            MQTT_L --- STATE
+            FE --- STATE
+            HK --- STATE
+        end
+
+        %% === 物理设备：KITs ===
+        subgraph KIT_PHYSICAL ["PHYSICAL LAYER (执行单元)"]
+            direction LR
+            KIT_A["KIT_A1<br/>ESP32-C6<br/>TEMP+HUM+DISP"]:::mainBox
+            KIT_B["KIT_B1<br/>ESP32-C6<br/>PIR+RELAY"]:::mainBox
+            KIT_C["KIT_C1<br/>ESP32-C6<br/>SERVO+BUZZER"]:::mainBox
+        end
+
+        %% 协议标注
+        PROTO_LABEL["AE-Link Protocol Layer<br/>[POOL]/[GATE]/[KIT]/[SKILL]/[ACTION]"]:::protocol
+
+        %% 连接关系
+        KIT_A --- MQTT_L
+        KIT_B --- MQTT_L
+        KIT_C --- MQTT_L
+        
+        MQTT_L --- PROTO_LABEL
+        PROTO_LABEL --- KIT_A
+        PROTO_LABEL --- KIT_B
+        PROTO_LABEL --- KIT_C
+        
+        ADMIN ---|"HTTP GET/POST<br/>SSE Stream"| API_L
+    end
+
+    %% 外部连接 (修复语法，使用标准连接)
+    MQTT_BROKER ===|"MQTT v3.1.1 / TCP/IP"| MQTT_L

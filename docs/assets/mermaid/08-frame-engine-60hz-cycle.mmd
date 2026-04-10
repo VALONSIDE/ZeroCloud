@@ -1,0 +1,92 @@
+%%{init: {'theme': 'base', 'themeVariables': { 'fontFamily': 'Courier New', 'fontSize': '16px', 'primaryColor': '#fff'}}}%%
+flowchart TD
+    %% 样式定义
+    classDef main fill:#fff,stroke:#000,stroke-width:2px,rx:0px,ry:0px,font-weight:bold;
+    classDef sub fill:#fff,stroke:#000,stroke-width:1px,rx:0px,ry:0px;
+    classDef phase fill:#e8e8e8,stroke:#000,stroke-width:2px,rx:0px,ry:0px;
+    classDef lock fill:#fff,stroke:#000,stroke-width:3px,stroke-dasharray:4 4,rx:0px,ry:0px;
+    classDef time fill:#fff,stroke:#000,stroke-width:1px,rx:0px,ry:0px,font-size:14px;
+    classDef error fill:#fff,stroke:#f00,stroke-width:1px,rx:0px,ry:0px,color:#000;
+
+    %% === 调度器入口 ===
+    subgraph SCHEDULER ["60Hz SCHEDULER (LOOP TRIGGER)"]
+        TICK["TIMER TICK / FRAME START"]:::main
+    end
+
+    %% === 时间预算分配 ===
+    subgraph TIME_BUDGET ["FRAME TIME BUDGET (16.6ms TOTAL)"]
+        direction LR
+        T1["P1: Snapshot<br/>~2.0ms"]:::time
+        T2["P2: Evaluation<br/>~8.0ms"]:::time
+        T3["P3: Cooldown<br/>~1.5ms"]:::time
+        T4["P4: Action<br/>~2.0ms"]:::time
+        T5["P5: Update<br/>~3.1ms"]:::time
+        T1 --> T2 --> T3 --> T4 --> T5
+    end
+
+    %% === 核心执行循环 ===
+    subgraph FRAME_CYCLE ["ATOMIC FRAME EXECUTION CYCLE"]
+        direction TB
+
+        subgraph PHASE1 ["PHASE 1: READ SNAPSHOT (ISOLATION)"]
+            ACQ_L1["ACQUIRE MUTEX LOCK"]:::lock
+            DEEP_COPY["DEEP COPY STATE TABLE<br/>(Isolate from MQTT Writes)"]:::phase
+            REL_L1["RELEASE LOCK (Snapshot Ready)"]:::lock
+        end
+
+        subgraph PHASE2 ["PHASE 2: RULE EVALUATION (COMPUTE)"]
+            ITER_EVT["ITERATE ENABLED EVENTS"]:::sub
+            LOAD_CTX["LOAD CONTEXT<br/>(Snapshot Values, Latch State)"]:::sub
+            RUN_EVAL["EXECUTE eval(ctx)<br/>(Form/Code Sandbox)"]:::phase
+            CHECK_RET["VALIDATE RETURN<br/>(bool / action_dict / None)"]:::sub
+        end
+
+        subgraph PHASE3 ["PHASE 3: COOLDOWN & RATE LIMIT"]
+            CHECK_CD["CHECK COOLDOWN TIMER<br/>(Prevent Flicker/Spam)"]:::sub
+            RATE_OK{"RATE LIMIT OK?"}:::phase
+            SKIP_ACT["SKIP ACTION<br/>(Only Update Cooldown)"]:::sub
+        end
+
+        subgraph PHASE4 ["PHASE 4: ACTION EMISSION (IO)"]
+            BUILD_PAY["BUILD MQTT PAYLOAD<br/>(Target, Skill, Params)"]:::sub
+            ASYNC_PUB["ASYNC PUBLISH QUEUE<br/>(Non-blocking Dispatch)"]:::phase
+        end
+
+        subgraph PHASE5 ["PHASE 5: STATE UPDATE & UNLOCK"]
+            ACQ_L2["ACQUIRE MUTEX LOCK"]:::lock
+            WRITE_BACK["UPDATE COOLDOWN<br/>, LAST_TRIGGER, ERROR_FLAGS"]:::phase
+            REL_L2["RELEASE LOCK"]:::lock
+            SSE_PUSH["PUSH SSE UPDATE TO FRONTEND"]:::sub
+        end
+
+        %% 阶段内连线
+        ACQ_L1 --> DEEP_COPY --> REL_L1
+        REL_L1 --> ITER_EVT --> LOAD_CTX --> RUN_EVAL --> CHECK_RET
+        CHECK_RET --> CHECK_CD --> RATE_OK
+        
+        RATE_OK -->|YES| BUILD_PAY
+        RATE_OK -->|NO| SKIP_ACT
+        
+        BUILD_PAY --> ASYNC_PUB
+        ASYNC_PUB --> ACQ_L2
+        SKIP_ACT --> ACQ_L2
+        
+        ACQ_L2 --> WRITE_BACK --> REL_L2
+        REL_L2 --> SSE_PUSH
+    end
+
+    %% === 异常处理与循环回归 ===
+    subgraph FAULT_ISOLATION ["FAULT ISOLATION & LOOP RETURN"]
+        MARK_ERR["MARK EVENT: ERROR<br/>(Inject to State Table)"]:::error
+        LOG_FAIL["LOG FAILURE TRACE<br/>(Do Not Crash Engine)"]:::sub
+        CONT_NEXT["CONTINUE NEXT FRAME<br/>(Strict Non-blocking)"]:::main
+    end
+
+    %% 异常分支
+    RUN_EVAL -.->|EXCEPTION| MARK_ERR
+    CHECK_RET -.->|INVALID TYPE| MARK_ERR
+    MARK_ERR --> LOG_FAIL --> CONT_NEXT
+    
+    %% 正常回归
+    SSE_PUSH --> TICK
+    CONT_NEXT --> TICK

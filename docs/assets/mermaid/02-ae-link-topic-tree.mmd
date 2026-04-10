@@ -1,0 +1,80 @@
+%%{init: {'theme': 'base', 'themeVariables': { 'fontFamily': 'Courier New', 'fontSize': '15px', 'primaryColor': '#fff'}}}%%
+flowchart TD
+    %% 样式定义
+    classDef root fill:#fff,stroke:#000,stroke-width:3px,rx:0px,ry:0px,font-weight:bold;
+    classDef branch fill:#f4f4f4,stroke:#000,stroke-width:2px,rx:0px,ry:0px;
+    classDef leaf fill:#fff,stroke:#000,stroke-width:1px,rx:0px,ry:0px;
+    classDef payload fill:#e8e8e8,stroke:#000,stroke-width:1px,rx:0px,ry:0px,font-size:14px;
+    classDef path fill:#fff,stroke:#000,stroke-width:1px,stroke-dasharray:4 4;
+
+    %% === 根节点 ===
+    PROTOCOL_ROOT(["AE-LINK PROTOCOL<br/>Topic Structure"]):::root
+
+    %% === 左分支：生命周期 (组网) ===
+    subgraph LIFECYCLE ["LIFECYCLE MANAGEMENT (Zero-Touch)"]
+        class LIFECYCLE branch;
+        direction TB
+        
+        %% 1. Pending
+        L_PEND["PENDING<br/>POOL_ZC/PENDING/{uid}"]:::leaf
+        subgraph PL_PEND ["Payload: Device Skills"]
+            PP1["skills: [SKILL_TEMP, ...]"]:::payload
+        end
+
+        %% 2. Provision
+        L_PROV["PROVISION<br/>POOL_ZC/PROVISION/{uid}"]:::leaf
+        subgraph PL_PROV ["Payload: Config"]
+            PP2["pool_id: POOL_A, kit_id: KIT_A1"]:::payload
+        end
+
+        %% 3. Status
+        L_STAT["STATUS<br/>{POOL}/{GATE}/{KIT}/STATUS"]:::leaf
+        subgraph PL_STAT ["Payload: Online State"]
+            PP3["status: ONLINE, skills: [...]"]:::payload
+        end
+
+        %% 内部连接
+        L_PEND --- PP1
+        L_PROV --- PP2
+        L_STAT --- PP3
+    end
+
+    %% === 右分支：运行时 (业务) ===
+    subgraph RUNTIME ["RUNTIME DATA & CONTROL"]
+        class RUNTIME branch;
+        direction TB
+
+        %% 路径规范
+        R_PATH["GENERAL PATH STRUCTURE<br/>[POOL]/[GATE]/[KIT]/[SKILL]/[ACTION]"]:::path
+
+        %% 1. 技能上报
+        R_REP["REPORT (Uplink)<br/>.../SKILL_TEMP ->"]:::leaf
+        subgraph PL_REP ["Payload: Sensor Data"]
+            PR1["value: 27.5"]:::payload
+        end
+
+        %% 2. 技能控制
+        R_SET["SET (Downlink)<br/>.../SKILL_DISPLAY/SET ->"]:::leaf
+        subgraph PL_SET ["Payload: Command"]
+            PS1["msg: WARN, duration: 5000"]:::payload
+        end
+
+        %% 3. 系统控制
+        R_SYS["SYSTEM (Downlink)<br/>.../SYS/RESET ->"]:::leaf
+        subgraph PL_SYS ["Payload: System Cmd"]
+            PS2["source: GATE"]:::payload
+        end
+
+        %% 内部连接
+        R_PATH --> R_REP
+        R_PATH --> R_SET
+        R_PATH --> R_SYS
+        
+        R_REP --- PR1
+        R_SET --- PS1
+        R_SYS --- PS2
+    end
+
+    %% === 顶层连接 ===
+    PROTOCOL_ROOT === LIFECYCLE
+    PROTOCOL_ROOT === RUNTIME

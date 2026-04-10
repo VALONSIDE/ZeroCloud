@@ -1,0 +1,58 @@
+%%{init: {'theme': 'base', 'themeVariables': { 'fontFamily': 'Courier New', 'fontSize': '16px', 'primaryColor': '#fff'}}}%%
+flowchart TB
+    %% 样式定义
+    classDef main fill:#fff,stroke:#000,stroke-width:2px,rx:0px,ry:0px,font-weight:bold;
+    classDef pool fill:#fff,stroke:#000,stroke-width:3px,rx:0px,ry:0px;
+    classDef gate fill:#e8e8e8,stroke:#000,stroke-width:2px,rx:0px,ry:0px;
+    classDef kit fill:#fff,stroke:#000,stroke-width:1px,rx:0px,ry:0px;
+    classDef sync fill:#fff,stroke:#000,stroke-width:1px,rx:0px,ry:0px,stroke-dasharray:4 4;
+    classDef alpha fill:#fff,stroke:#888,stroke-width:1px,rx:0px,ry:0px,stroke-dasharray:2 2;
+
+    %% === POOL 域 ===
+    subgraph POOL_DOMAIN ["POOL_HALL_A (Global Scope)"]
+        class POOL_DOMAIN pool;
+        
+        %% MQTT 总线
+        BROKER((MQTT BROKER<br/>v3.1.1)):::main
+
+        %% === 演进路径 1: Alpha (单体) ===
+        subgraph ALPHA_ARCH ["ALPHA (Single Gate)"]
+            GATE_A["GATE_01 (Master/Parent)<br/>State: ONLINE<br/>Role: Coordinator"]:::gate
+            KITA["KIT_A1<br/>(Local Connection)"]:::kit
+            
+            BROKER === GATE_A
+            GATE_A ---|"AE-Link"| KITA
+        end
+
+        %% === 演进路径 2: Beta (Mesh 集群) ===
+        subgraph BETA_ARCH ["BETA (Multi-Gate Mesh)"]
+            direction LR
+            
+            %% GATE A 依然是中心
+            GATE_A_NEW["GATE_01 (Master)<br/>Role: Sync Source"]:::gate
+            
+            %% 新加入的 GATE B
+            GATE_B["GATE_02 (Neighbor)<br/>State: SYNCING<br/>Role: Edge Node"]:::gate
+            KITB["KIT_B1<br/>(Local Connection)"]:::kit
+
+            %% 邻居发现
+            DISCOVERY["NEIGHBOR DISCOVERY<br/>(via SYS_GATE/ANNOUNCE)"]:::sync
+            GATE_A_NEW -.->|Announce| DISCOVERY
+            DISCOVERY -.->|Detect| GATE_B
+
+            %% 增量同步
+            SYNC_BUS["INCREMENTAL SYNC BUS<br/>State Delta (JSON Patch)<br/>Event Rules (Replication)"]:::sync
+            GATE_A_NEW <==>|Sync| SYNC_BUS
+            SYNC_BUS <==>|Sync| GATE_B
+
+            %% 本地低延迟闭环
+            GATE_B ---|"AE-Link<br/>(Local Loop)"| KITB
+
+            %% 统一连接 Broker
+            BROKER === GATE_A_NEW
+            BROKER === GATE_B
+        end
+    end
+
+    %% 连接关系
+    ALPHA_ARCH ~~~ BETA_ARCH

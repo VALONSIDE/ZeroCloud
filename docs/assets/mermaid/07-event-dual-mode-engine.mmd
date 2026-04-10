@@ -1,0 +1,82 @@
+%%{init: {'theme': 'base', 'themeVariables': { 'fontFamily': 'Courier New', 'fontSize': '16px', 'primaryColor': '#fff'}}}%%
+flowchart TD
+    %% 样式定义：技术手册级直角黑白
+    classDef main fill:#fff,stroke:#000,stroke-width:2px,rx:0px,ry:0px,font-weight:bold;
+    classDef sub fill:#fff,stroke:#000,stroke-width:1px,rx:0px,ry:0px;
+    classDef phase fill:#e8e8e8,stroke:#000,stroke-width:2px,rx:0px,ry:0px;
+    classDef safety fill:#fff,stroke:#000,stroke-width:1px,rx:0px,ry:0px,stroke-dasharray:3 3;
+    classDef error fill:#fff,stroke:#f00,stroke-width:1px,rx:0px,ry:0px,color:#000;
+    classDef code_blk fill:#fff,stroke:#000,stroke-width:1px,rx:0px,ry:0px,font-size:14px;
+
+    %% === 输入层 ===
+    subgraph INPUT_CTX ["INPUT CONTEXT & STATE"]
+        SKILL_VALS["SKILL VALUES<br/>{TEMP: 27.5, HUM: 60}"]:::main
+        KIT_STATES["KIT STATES<br/>{ONLINE, LAST_SEEN, LATCH}"]:::main
+        EVENT_CFG["EVENT DEFINITION<br/>(Mode: FORM | CODE)"]:::main
+    end
+
+    %% === 模式分发与解析层 ===
+    subgraph MODE_DISPATCH ["MODE DISPATCH & PARSING"]
+        direction TB
+        
+        subgraph FORM_PIPE ["FORM MODE PIPELINE (80% CASES)"]
+            F_PARSE["PARSER: Threshold/State Logic"]:::sub
+            F_CHECK_SK["VALIDATE: SKILL Existence & Type"]:::safety
+            F_COMPILE["COMPILE: eval(ctx) -> bool/action"]:::phase
+        end
+
+        subgraph CODE_PIPE ["CODE MODE PIPELINE (20% CASES)"]
+            C_LOAD["LOADER: Restricted Sandbox Inject"]:::sub
+            C_AST["SYNTAX CHECK: AST Parse & Lint"]:::safety
+            C_WRAP["TIMEOUT WRAPPER: Max 50ms Hard Limit"]:::safety
+            C_COMPILE["COMPILE: eval(ctx) -> bool/action"]:::phase
+        end
+    end
+
+    %% === 统一执行管道 ===
+    subgraph EXEC_PIPELINE ["UNIFIED EXECUTION PIPELINE"]
+        EXEC_RUN["EXECUTE eval(ctx)"]:::main
+        RET_CHECK["VALIDATE RETURN TYPE<br/>(bool / dict / None)"]:::sub
+        ACT_BUILD["BUILD STANDARD ACTION<br/>{target_kit, skill, payload}"]:::phase
+        MQTT_PUSH["ASYNC PUBLISH TO BROKER"]:::main
+    end
+
+    %% === 反馈与状态回写 ===
+    subgraph FEEDBACK ["FEEDBACK & STATE PERSISTENCE"]
+        ERR_MARK["MARK EVENT STATUS: ERROR"]:::error
+        LOG_TRACE["LOG TRACE & METRICS"]:::sub
+        ST_UPDATE["UPDATE STATE TABLE<br/>(Cooldown, Last_Trigger, Flags)"]:::sub
+    end
+
+    %% === 连线逻辑 ===
+    EVENT_CFG --> FORM_PIPE
+    EVENT_CFG --> CODE_PIPE
+    
+    FORM_PIPE --> F_CHECK_SK
+    F_CHECK_SK --> F_COMPILE
+    CODE_PIPE --> C_AST
+    C_AST --> C_WRAP
+    C_WRAP --> C_COMPILE
+
+    F_COMPILE --> EXEC_RUN
+    C_COMPILE --> EXEC_RUN
+    
+    SKILL_VALS --> EXEC_RUN
+    KIT_STATES --> EXEC_RUN
+
+    EXEC_RUN --> RET_CHECK
+    RET_CHECK --> ACT_BUILD
+    ACT_BUILD --> MQTT_PUSH
+    MQTT_PUSH --> ST_UPDATE
+    
+    EXEC_RUN -.-> LOG_TRACE
+    ST_UPDATE -.-> LOG_TRACE
+
+    %% === 安全拦截路径 ===
+    F_CHECK_SK -.->|INVALID SKILL| ERR_MARK
+    C_AST -.->|SYNTAX ERROR| ERR_MARK
+    C_WRAP -.->|TIMEOUT EXCEEDED| ERR_MARK
+    RET_CHECK -.->|BAD RETURN TYPE| ERR_MARK
+    
+    ERR_MARK --> LOG_TRACE
+    ERR_MARK -.-> ST_UPDATE

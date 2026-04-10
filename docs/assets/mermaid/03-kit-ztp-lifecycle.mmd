@@ -1,0 +1,89 @@
+%%{init: {'theme': 'base', 'themeVariables': { 'fontFamily': 'Arial', 'fontSize': '16px', 'primaryColor': '#fff'}}}%%
+flowchart TD
+    %% 样式定义：技术手册风
+    classDef mainBox fill:#fff,stroke:#000,stroke-width:2px,rx:0px,ry:0px,font-weight:bold;
+    classDef subBox fill:#fff,stroke:#000,stroke-width:1px,rx:0px,ry:0px;
+    classDef highlight fill:#e0e0e0,stroke:#000,stroke-width:2px,rx:0px,ry:0px;
+    classDef netBox fill:#fff,stroke:#000,stroke-width:1px,rx:0px,ry:0px,stroke-dasharray:4 4;
+    classDef storage fill:#f4f4f4,stroke:#000,stroke-width:1px,rx:0px,ry:0px;
+
+    %% === 设备侧：KIT LIFECYCLE ===
+    subgraph KIT_DEVICE ["KIT DEVICE (ESP32 / MCU)"]
+        direction TB
+
+        %% 1. 上电阶段
+        subgraph BOOT ["1. BOOT PHASE"]
+            B1["POWER ON"]:::highlight
+            B2["CHECK NVS / FLASH"]:::storage
+            B3["HAS CONFIG?"]:::subBox
+            B4["READ POOL_ID / KIT_ID"]:::storage
+            B1 --> B2 --> B3
+        end
+
+        %% 2. 配置阶段 (Pending)
+        subgraph PROVISIONING ["2. PROVISIONING (Zero-Touch)"]
+            direction LR
+            P1["GEN UID (001122...)"]:::mainBox
+            P2["PUB: POOL_ZC/PENDING/{UID}"]:::subBox
+            P3["WAIT: POOL_ZC/PROVISION"]:::subBox
+            P4["RCV: POOL_ID, GATE_ID, KIT_ID"]:::subBox
+            P5["WRITE NVS + REBOOT"]:::storage
+            
+            P1 --> P2 -.->|MQTT| P3 --> P4 --> P5
+        end
+
+        %% 3. 运行阶段 (Normal)
+        subgraph NORMAL_OP ["3. NORMAL OPERATION"]
+            direction LR
+            N1["INIT PERIPHERALS"]:::mainBox
+            N2["PUB: STATUS (ONLINE)"]:::subBox
+            N3["PUB: SKILL_DATA (1Hz)"]:::subBox
+            N4["SUB: CONTROL_CMD"]:::subBox
+            N5["EXEC: ACTION / DISPLAY"]:::subBox
+            
+            N1 --> N2 --> N3
+            N4 --> N5
+        end
+
+        %% 4. 异常与遗嘱
+        subgraph FAULT ["4. FAULT & RECOVERY"]
+            LWT["SET MQTT LWT (OFFLINE)"]:::storage
+            DISCONNECT["BROKER DISCONNECT"]:::subBox
+            RESET["PHYSICAL RESET BTN"]:::subBox
+            
+            LWT -.-> DISCONNECT
+            RESET --> B1
+        end
+        
+        %% 连接流程
+        B3 -- YES --> B4 --> N1
+        B3 -- NO --> P1
+        
+        N3 -.->|MQTT| P2
+        N4 -.->|MQTT| P3
+        
+        N1 -.-> LWT
+        N5 --> N3
+    end
+
+    %% === 网络侧：GATE LOGIC ===
+    subgraph GATE_NETWORK ["GATE / MQTT BROKER LOGIC"]
+        direction TB
+        
+        G1["MQTT LISTENER"]:::mainBox
+        G2["PARSE: POOL_ZC/PENDING"]:::subBox
+        G3["GENERATE PROVISION MSG"]:::subBox
+        G4["UID MERGE CHECK"]:::subBox
+        G5["UPDATE STATE TABLE"]:::subBox
+        G6["PUB: PROVISION REPLY"]:::subBox
+        
+        G1 --> G2 --> G4 --> G5
+        G4 --> G3 --> G6
+        
+        G6 -.->|MQTT| P4
+        G5 -.->|MQTT| N2
+    end
+
+    %% 连接两侧
+    P2 ~~~ G1
+    G6 ~~~ P4
