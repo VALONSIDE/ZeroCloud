@@ -1,6 +1,6 @@
 {
   "name": "zerocloud-gate-console",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,6 +9,7 @@
     "preview": "vite preview --host 0.0.0.0 --port 4173"
   },
   "dependencies": {
+    "metro-ui": "^3.0.15",
     "vue": "^3.5.13"
   },
   "devDependencies": {

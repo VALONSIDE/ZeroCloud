@@ -1,5 +1,5 @@
 /*
- * ZeroCloud Alpha_260409 - ESP32-C6 KIT Reference
+ * ZeroCloud Alpha_260410 - ESP32-C6 KIT Reference
  * Copyright (C) 2026 Lei Wu
  *
  * SPDX-License-Identifier: GPL-3.0-only
@@ -16,41 +16,45 @@
 #include <Preferences.h>
 #include <esp_mac.h>
 
-// ---------------- Hardware ----------------
+// ================= Hardware =================
 #define DHTPIN 4
 #define DHTTYPE DHT11
 #define I2C_SDA 6
 #define I2C_SCL 7
 #define BOOT_BTN 9
 
-// ---------------- Project constants ----------------
+// ================= Protocol constants =================
 static const char* BOOTSTRAP_POOL_ID = "POOL_ZC";
-static const char* SKILL_LIST = "[\"SKILL_TEMP\",\"SKILL_HUM\",\"SKILL_DISPLAY\"]";
+static const char* SKILL_CAPABILITIES_JSON = R"([{"id":"SKILL_TEMP","io":"input"},{"id":"SKILL_HUM","io":"input"},{"id":"SKILL_DISPLAY","io":"output","actions":[{"name":"SET","params":[{"key":"msg","type":"string","required":true},{"key":"duration","type":"number","default":5000,"min":500,"max":60000}]}],"supports_duration":true}])";
+static const char* SKILL_LEGACY_LIST_JSON = R"(["SKILL_TEMP","SKILL_HUM","SKILL_DISPLAY"])";
 
-// Fill with your deployment values.
-static const char* WIFI_SSID = "CHANGE_ME_WIFI_SSID";
-static const char* WIFI_PASS = "CHANGE_ME_WIFI_PASS";
-static const char* MQTT_BROKER = "192.168.1.10";
+// ================= Deployment values =================
+// Fill with your deployment values before flashing.
+const char* WIFI_SSID = "CHANGE_ME_WIFI_SSID";
+const char* WIFI_PASS = "CHANGE_ME_WIFI_PASSWORD";
+const char* BROKER_IP = "CHANGE_ME_MQTT_HOST";
 
-WiFiClient wifiClient;
-PubSubClient mqttClient(wifiClient);
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
 DHT dht(DHTPIN, DHTTYPE);
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
 Preferences prefs;
 
-String kitUID;
+String kitUID = "";
 bool isProvisioned = false;
-String poolID;
-String gateID;
-String kitID;
+String poolID = "";
+String poolName = "";
+String gateID = "";
+String gateName = "";
+String kitID = "";
 
 float currentTemp = 0.0f;
 float currentHum = 0.0f;
-unsigned long lastSensorMs = 0;
+unsigned long lastSensorTimeMs = 0;
 bool blinkState = false;
 
 String overrideMsg = "";
-unsigned long overrideEndMs = 0;
+unsigned long overrideEndTimeMs = 0;
 
 bool btnPressed = false;
 unsigned long btnPressStartMs = 0;
@@ -68,8 +72,16 @@ String generateUID() {
   return String(uid);
 }
 
-String skillTopic(const String& skillID) {
+String statusTopic() {
+  return poolID + "/" + gateID + "/" + kitID + "/STATUS";
+}
+
+String skillValueTopic(const String& skillID) {
   return poolID + "/" + gateID + "/" + kitID + "/" + skillID;
+}
+
+String profileAnnounceTopic() {
+  return poolID + "/" + gateID + "/SYS_GATE/PROFILE/ANNOUNCE";
 }
 
 void wipeProvisioning(const char* message) {
@@ -80,16 +92,16 @@ void wipeProvisioning(const char* message) {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
-  display.setCursor(6, 28);
+  display.setCursor(8, 28);
   display.print(message);
   display.display();
-  delay(1500);
+  delay(1400);
   ESP.restart();
 }
 
 void drawUI() {
   display.clearDisplay();
-  if (millis() < overrideEndMs && overrideMsg.length() > 0) {
+  if (millis() < overrideEndTimeMs && overrideMsg.length() > 0) {
     if (blinkState) {
       display.fillRect(0, 0, 128, 64, SSD1306_WHITE);
     }
@@ -121,7 +133,7 @@ void drawUI() {
     display.setTextColor(SSD1306_BLACK);
     display.setTextSize(1);
     display.setCursor(5, 4);
-    display.print("[" + gateID + "] " + kitID);
+    display.print("[" + (gateName.length() ? gateName : gateID) + "] " + kitID);
 
     display.setTextColor(SSD1306_WHITE);
     display.setTextSize(2);
@@ -132,28 +144,60 @@ void drawUI() {
     display.print("H:");
     display.print(currentHum, 1);
   }
-
   display.display();
 }
 
-void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  String topicStr = String(topic);
-  String payloadStr;
-  payloadStr.reserve(length);
-  for (unsigned int i = 0; i < length; ++i) {
-    payloadStr += static_cast<char>(payload[i]);
+void applyDisplayCommand(const String& payloadText) {
+  StaticJsonDocument<256> doc;
+  DeserializationError err = deserializeJson(doc, payloadText);
+  if (err) {
+    return;
+  }
+  overrideMsg = doc["msg"].as<String>();
+  overrideEndTimeMs = millis() + (doc.containsKey("duration") ? doc["duration"].as<int>() : 5000);
+}
+
+void handleSkillCommand(const String& commandPath, const String& payloadText) {
+  const int divider = commandPath.lastIndexOf('/');
+  if (divider <= 0) {
+    return;
+  }
+  const String skillID = commandPath.substring(0, divider);
+  const String action = commandPath.substring(divider + 1);
+
+  if (skillID == "SYS" && action == "RESET") {
+    wipeProvisioning("REMOTE RESET");
+    return;
   }
 
-  if (!isProvisioned && topicStr == (String(BOOTSTRAP_POOL_ID) + "/PROVISION/" + kitUID)) {
+  if (skillID == "SKILL_DISPLAY" && action == "SET") {
+    applyDisplayCommand(payloadText);
+    return;
+  }
+
+  // For new output skills, append handler branches here.
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  const String topicText = String(topic);
+  String payloadText;
+  payloadText.reserve(length);
+  for (unsigned int i = 0; i < length; ++i) {
+    payloadText += static_cast<char>(payload[i]);
+  }
+
+  const String provisionTopic = String(BOOTSTRAP_POOL_ID) + "/PROVISION/" + kitUID;
+  if (!isProvisioned && topicText == provisionTopic) {
     StaticJsonDocument<256> doc;
-    DeserializationError err = deserializeJson(doc, payloadStr);
+    DeserializationError err = deserializeJson(doc, payloadText);
     if (err) {
       return;
     }
-
     prefs.begin("zc_arch", false);
     prefs.putString("pool", doc["pool_id"].as<String>());
+    prefs.putString("pool_name", doc["pool_name"].as<String>());
     prefs.putString("gate", doc["gate_id"].as<String>());
+    prefs.putString("gate_name", doc["gate_name"].as<String>());
     prefs.putString("kit", doc["kit_id"].as<String>());
     prefs.putBool("prov", true);
     prefs.end();
@@ -166,20 +210,64 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     display.display();
     delay(1200);
     ESP.restart();
+    return;
   }
 
-  if (isProvisioned && topicStr.endsWith("SYS/RESET")) {
-    wipeProvisioning("REMOTE RESET");
+  if (!isProvisioned) {
+    return;
   }
 
-  if (isProvisioned && topicStr.endsWith("SKILL_DISPLAY/SET")) {
-    StaticJsonDocument<256> doc;
-    DeserializationError err = deserializeJson(doc, payloadStr);
-    if (err) {
+  if (topicText == profileAnnounceTopic()) {
+    StaticJsonDocument<256> profileDoc;
+    DeserializationError profileErr = deserializeJson(profileDoc, payloadText);
+    if (profileErr) {
       return;
     }
-    overrideMsg = doc["msg"].as<String>();
-    overrideEndMs = millis() + (doc.containsKey("duration") ? doc["duration"].as<int>() : 5000);
+    const String nextPoolName = String(profileDoc["pool_name"] | poolName);
+    const String nextGateName = String(profileDoc["gate_name"] | gateName);
+    if (
+      (nextPoolName.length() && nextPoolName != poolName)
+      || (nextGateName.length() && nextGateName != gateName)
+    ) {
+      poolName = nextPoolName.length() ? nextPoolName : poolID;
+      gateName = nextGateName.length() ? nextGateName : gateID;
+      prefs.begin("zc_arch", false);
+      prefs.putString("pool_name", poolName);
+      prefs.putString("gate_name", gateName);
+      prefs.end();
+    }
+    return;
+  }
+
+  const String ownPrefix = poolID + "/" + gateID + "/" + kitID + "/";
+  if (!topicText.startsWith(ownPrefix)) {
+    return;
+  }
+  const String commandPath = topicText.substring(ownPrefix.length());
+  handleSkillCommand(commandPath, payloadText);
+}
+
+void publishPending() {
+  const String topic = String(BOOTSTRAP_POOL_ID) + "/PENDING/" + kitUID;
+  const String payload =
+    String("{\"uid\":\"") + kitUID + "\",\"protocol\":\"ZC_SKILL_CAP_V1\",\"skills\":" +
+    String(SKILL_CAPABILITIES_JSON) + "}";
+  if (!mqttClient.publish(topic.c_str(), payload.c_str(), false)) {
+    const String fallback =
+      String("{\"uid\":\"") + kitUID + "\",\"skills\":" + String(SKILL_LEGACY_LIST_JSON) + "}";
+    mqttClient.publish(topic.c_str(), fallback.c_str(), false);
+  }
+}
+
+void publishOnlineStatus() {
+  const String payload =
+    String("{\"status\":\"ONLINE\",\"uid\":\"") + kitUID +
+    "\",\"protocol\":\"ZC_SKILL_CAP_V1\",\"skills\":" + String(SKILL_CAPABILITIES_JSON) + "}";
+  if (!mqttClient.publish(statusTopic().c_str(), payload.c_str(), true)) {
+    const String fallback =
+      String("{\"status\":\"ONLINE\",\"uid\":\"") + kitUID +
+      "\",\"skills\":" + String(SKILL_LEGACY_LIST_JSON) + "}";
+    mqttClient.publish(statusTopic().c_str(), fallback.c_str(), true);
   }
 }
 
@@ -188,24 +276,29 @@ void ensureMqttConnected() {
     return;
   }
 
-  mqttClient.setServer(MQTT_BROKER, 1883);
+  mqttClient.setServer(BROKER_IP, 1883);
+
   if (!isProvisioned) {
     if (mqttClient.connect(kitUID.c_str())) {
-      String pendingTopic = String(BOOTSTRAP_POOL_ID) + "/PENDING/" + kitUID;
-      String provisionTopic = String(BOOTSTRAP_POOL_ID) + "/PROVISION/" + kitUID;
-      String payload = "{\"skills\":" + String(SKILL_LIST) + "}";
-      mqttClient.publish(pendingTopic.c_str(), payload.c_str());
-      mqttClient.subscribe(provisionTopic.c_str());
+      publishPending();
+      mqttClient.subscribe((String(BOOTSTRAP_POOL_ID) + "/PROVISION/" + kitUID).c_str());
     }
     return;
   }
 
-  String statusTopic = skillTopic("STATUS");
-  String lwtPayload = "{\"status\":\"OFFLINE\"}";
-  if (mqttClient.connect(kitID.c_str(), "", "", statusTopic.c_str(), 1, true, lwtPayload.c_str())) {
-    String onlinePayload = "{\"status\":\"ONLINE\",\"uid\":\"" + kitUID + "\",\"skills\":" + String(SKILL_LIST) + "}";
-    mqttClient.publish(statusTopic.c_str(), onlinePayload.c_str(), true);
+  const String lwtPayload = String("{\"status\":\"OFFLINE\",\"uid\":\"") + kitUID + "\"}";
+  if (mqttClient.connect(
+      kitID.c_str(),
+      "",
+      "",
+      statusTopic().c_str(),
+      1,
+      true,
+      lwtPayload.c_str()
+  )) {
+    publishOnlineStatus();
     mqttClient.subscribe((poolID + "/" + gateID + "/" + kitID + "/#").c_str());
+    mqttClient.subscribe(profileAnnounceTopic().c_str());
   }
 }
 
@@ -216,7 +309,9 @@ void setup() {
   pinMode(BOOT_BTN, INPUT_PULLUP);
 
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    for (;;) { delay(10); }
+    for (;;) {
+      delay(10);
+    }
   }
 
   kitUID = generateUID();
@@ -224,18 +319,21 @@ void setup() {
   isProvisioned = prefs.getBool("prov", false);
   if (isProvisioned) {
     poolID = prefs.getString("pool", "POOL_ZC");
+    poolName = prefs.getString("pool_name", poolID);
     gateID = prefs.getString("gate", "GATE_01");
+    gateName = prefs.getString("gate_name", gateID);
     kitID = prefs.getString("kit", "KIT_00001");
   }
   prefs.end();
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
+  mqttClient.setBufferSize(768);
   mqttClient.setCallback(mqttCallback);
 }
 
 void loop() {
-  unsigned long now = millis();
+  const unsigned long now = millis();
 
   if (digitalRead(BOOT_BTN) == LOW) {
     if (!btnPressed) {
@@ -259,16 +357,22 @@ void loop() {
     mqttClient.loop();
   }
 
-  if (now - lastSensorMs > 3000) {
-    lastSensorMs = now;
-    float h = dht.readHumidity();
-    float t = dht.readTemperature();
-    if (!isnan(h) && !isnan(t)) {
-      currentHum = h;
-      currentTemp = t;
+  if (now - lastSensorTimeMs > 3000) {
+    lastSensorTimeMs = now;
+    const float hum = dht.readHumidity();
+    const float temp = dht.readTemperature();
+    if (!isnan(hum) && !isnan(temp)) {
+      currentHum = hum;
+      currentTemp = temp;
       if (isProvisioned && mqttClient.connected()) {
-        mqttClient.publish(skillTopic("SKILL_TEMP").c_str(), (String("{\"value\":") + String(currentTemp, 1) + "}").c_str());
-        mqttClient.publish(skillTopic("SKILL_HUM").c_str(), (String("{\"value\":") + String(currentHum, 1) + "}").c_str());
+        mqttClient.publish(
+          skillValueTopic("SKILL_TEMP").c_str(),
+          (String("{\"value\":") + String(currentTemp, 1) + "}").c_str()
+        );
+        mqttClient.publish(
+          skillValueTopic("SKILL_HUM").c_str(),
+          (String("{\"value\":") + String(currentHum, 1) + "}").c_str()
+        );
       }
     }
   }

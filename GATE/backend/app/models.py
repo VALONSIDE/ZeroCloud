@@ -107,7 +107,7 @@ class DiscoveredPool:
         if existing is None:
             self.gates[gate_id] = DiscoveredGate(gate_id=gate_id, gate_name=resolved_name)
             return
-        existing.touch(resolved_name)
+        existing.touch(gate_name.strip() if gate_name else None)
 
     def to_dict(self) -> Dict[str, Any]:
         gates = [item.to_dict() for item in self.gates.values()]
@@ -149,6 +149,7 @@ class KitState:
     status: str = "OFFLINE"
     skills: List[str] = field(default_factory=list)
     skill_values: Dict[str, Any] = field(default_factory=dict)
+    skill_meta: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     first_seen: datetime = field(default_factory=utc_now)
     last_seen: datetime = field(default_factory=utc_now)
     new_until: datetime = field(default_factory=_default_new_until)
@@ -174,6 +175,105 @@ class KitState:
                 merged.add(skill)
         self.skills = sorted(merged)
 
+    def merge_skill_meta(self, incoming: Dict[str, Dict[str, Any]]) -> None:
+        for skill_id, raw_meta in incoming.items():
+            normalized_skill = str(skill_id).strip()
+            if not normalized_skill:
+                continue
+            if normalized_skill not in self.skills:
+                self.skills.append(normalized_skill)
+
+            previous = dict(self.skill_meta.get(normalized_skill, {}))
+            merged = dict(previous)
+
+            io_type = str(raw_meta.get("io_type", "")).strip().lower()
+            if io_type in {"input", "output"}:
+                merged["io_type"] = io_type
+
+            supports_duration = raw_meta.get("supports_duration")
+            if isinstance(supports_duration, bool):
+                merged["supports_duration"] = supports_duration
+            elif isinstance(supports_duration, (int, float)):
+                merged["supports_duration"] = bool(supports_duration)
+
+            actions_raw = raw_meta.get("actions")
+            actions_source: List[Any] = []
+            if isinstance(actions_raw, str):
+                actions_source = [actions_raw]
+            elif isinstance(actions_raw, list):
+                actions_source = actions_raw
+            normalized_actions = sorted(
+                {
+                    str(action).strip().upper()
+                    for action in actions_source
+                    if str(action).strip()
+                }
+            )
+            if normalized_actions:
+                merged["actions"] = normalized_actions
+
+            raw_action_specs = raw_meta.get("action_specs")
+            normalized_action_specs: Dict[str, List[Dict[str, Any]]] = {}
+            if isinstance(raw_action_specs, dict):
+                for action_name, raw_fields in raw_action_specs.items():
+                    normalized_action = str(action_name).strip().upper()
+                    if not normalized_action:
+                        continue
+                    if not isinstance(raw_fields, list):
+                        continue
+                    fields: List[Dict[str, Any]] = []
+                    for raw_field in raw_fields:
+                        if not isinstance(raw_field, dict):
+                            continue
+                        key = str(
+                            raw_field.get("key")
+                            or raw_field.get("name")
+                            or raw_field.get("id")
+                            or ""
+                        ).strip()
+                        if not key:
+                            continue
+                        field: Dict[str, Any] = {"key": key}
+                        field_type = str(raw_field.get("type", "string")).strip().lower()
+                        if field_type not in {"string", "number", "boolean", "enum", "json"}:
+                            field_type = "string"
+                        field["type"] = field_type
+                        if "label" in raw_field:
+                            field["label"] = str(raw_field.get("label", "")).strip() or key
+                        if "required" in raw_field:
+                            field["required"] = bool(raw_field.get("required"))
+                        if "default" in raw_field:
+                            field["default"] = raw_field.get("default")
+                        if isinstance(raw_field.get("min"), (int, float)):
+                            field["min"] = raw_field.get("min")
+                        if isinstance(raw_field.get("max"), (int, float)):
+                            field["max"] = raw_field.get("max")
+                        options = raw_field.get("options")
+                        if isinstance(options, list):
+                            option_values = [
+                                str(item)
+                                for item in options
+                                if str(item).strip()
+                            ]
+                            if option_values:
+                                field["options"] = option_values
+                        if "placeholder" in raw_field:
+                            field["placeholder"] = str(
+                                raw_field.get("placeholder", "")
+                            ).strip()
+                        fields.append(field)
+                    if fields:
+                        normalized_action_specs[normalized_action] = fields
+            if normalized_action_specs:
+                merged["action_specs"] = normalized_action_specs
+                merged_actions = set(merged.get("actions", []))
+                merged_actions.update(normalized_action_specs.keys())
+                merged["actions"] = sorted(merged_actions)
+
+            self.skill_meta[normalized_skill] = merged
+
+        self.skills.sort()
+
     def lifecycle_state(self, now: Optional[datetime] = None) -> str:
         current = now or utc_now()
         if self.status != "ONLINE":
@@ -197,6 +297,9 @@ class KitState:
             "lifecycle_state": self.lifecycle_state(current),
             "skills": list(self.skills),
             "skill_values": dict(self.skill_values),
+            "skill_meta": {
+                skill_id: dict(meta) for skill_id, meta in self.skill_meta.items()
+            },
             "first_seen": to_iso(self.first_seen),
             "last_seen": to_iso(self.last_seen),
         }

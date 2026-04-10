@@ -5,18 +5,18 @@ export default {
     extend: {
       colors: {
         magi: {
-          bg: "#070b14",
-          panel: "#0e1629",
-          line: "#1d3257",
-          neon: "#5dd6ff",
-          warn: "#ffd86b",
-          danger: "#ff6f91",
-          success: "#70f4a5",
-          idle: "#8cb5ff"
+          bg: "#060606",
+          panel: "#101010",
+          line: "#303030",
+          neon: "#f4f4f5",
+          warn: "#d4d4d8",
+          danger: "#a1a1aa",
+          success: "#e4e4e7",
+          idle: "#d4d4d8"
         }
       },
       boxShadow: {
-        neon: "0 0 0 1px rgba(93,214,255,.22), 0 0 28px rgba(93,214,255,.16)"
+        neon: "0 0 0 1px rgba(244,244,245,.22)"
       }
     }
   },

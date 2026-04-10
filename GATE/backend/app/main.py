@@ -76,7 +76,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="ZeroCloud GATE / MAGI",
-    version="3.0.0",
+    version="3.1.0",
     description="ZeroCloud Edge Brain on POOL-GATE-KIT architecture.",
     lifespan=lifespan,
 )
@@ -96,6 +96,10 @@ app.include_router(
         event_store=event_store,
         profile_store=profile_store,
         kit_store=kit_store,
+        default_pool_id=settings.pool_id,
+        default_pool_name=settings.pool_name,
+        default_gate_id=settings.gate_id,
+        default_gate_name=settings.gate_name,
     )
 )
 

@@ -1,7 +1,7 @@
 # ZeroCloud KIT Reference (ESP32-C6)
 
 > SPDX-License-Identifier: GPL-3.0-only  
-> Version: Alpha_260409  
+> Version: Alpha_260410  
 > Author: Lei Wu
 
 本目录是 ZeroCloud 标准 KIT 参考实现，后续 KIT 开发应遵循该协议规范。
@@ -17,17 +17,18 @@
 3. 正式上线：发布 `{POOL}/{GATE}/{KIT}/STATUS`
 4. 周期上报：`SKILL_TEMP` / `SKILL_HUM`
 5. 控制执行：`SKILL_DISPLAY/SET`、`SYS/RESET`
+6. 能力自描述：通过 `skills` 上报 I/O、action 与参数 schema
 6. 本地恢复：长按按键清理配置
 
 ---
 
 ## 2. 配置说明
 
-编辑 `src/main.cpp`：
+编辑 `src/main.cpp`（发布前务必替换为现场参数）：
 
 - `WIFI_SSID`
 - `WIFI_PASS`
-- `MQTT_BROKER`
+- `BROKER_IP`
 
 这三个参数必须按你的现场网络修改。
 
@@ -56,11 +57,11 @@ pio device monitor
 
 ## 5. 与 GATE 的兼容要点
 
-Alpha_260409 的 GATE 已支持：
+Alpha_260410 的 GATE 已支持：
 
 - pending 按 `pending_pool_id` 收编；
 - UID 重合并逻辑（视为旧 KIT 重上线）；
-- SKILL 严格校验；
+- SKILL 能力元数据（`io/actions/action_specs`）解析与严格校验；
 - EVENT 表单/代码双模式。
 
 因此，后续 KIT 只要遵守本参考协议，即可接入现有 GATE。

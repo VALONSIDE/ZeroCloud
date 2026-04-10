@@ -32,6 +32,16 @@ class DisplayRequest(BaseModel):
     duration: int = Field(default=5000, ge=500, le=60000)
 
 
+class SkillInvokeRequest(BaseModel):
+    skill_id: str = Field(min_length=2, max_length=64)
+    action: str = Field(default="SET", min_length=2, max_length=32)
+    payload: Dict[str, Any] = Field(default_factory=dict)
+
+
+class CodeTestRequest(BaseModel):
+    code: str = Field(min_length=1, max_length=50000)
+
+
 class SkillRefRequest(BaseModel):
     kit_id: str = Field(min_length=2, max_length=32)
     skill_id: str = Field(min_length=2, max_length=64)
@@ -74,3 +84,7 @@ class EventUpsertRequest(BaseModel):
 
 class EventToggleRequest(BaseModel):
     enabled: bool
+
+
+class GateResetConfirmRequest(BaseModel):
+    code: str = Field(min_length=4, max_length=32)

@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 
 const snapshot = ref({
   revision: 0,
@@ -18,6 +18,7 @@ const snapshot = ref({
     events_total: 0,
     events_locked: 0,
     events_error: 0,
+    events_dead: 0,
     discovered_pools_total: 0,
     mqtt_connected: false
   },
@@ -36,6 +37,7 @@ const namesDirty = ref(false);
 
 const activeTab = ref("setup");
 const eventEditorTab = ref("form");
+const uiTheme = ref(localStorage.getItem("zc_console_theme") || "blue");
 
 const busy = reactive({
   loading: false,
@@ -49,8 +51,11 @@ const busy = reactive({
   reset_kit: "",
   save_form_event: false,
   save_code_event: false,
+  test_code: false,
   toggle_event: "",
-  delete_event: ""
+  delete_event: "",
+  gate_reset_code: false,
+  gate_reset_confirm: false
 });
 
 const namesForm = reactive({
@@ -59,30 +64,32 @@ const namesForm = reactive({
 });
 
 const setupJoinForm = reactive({
-  pool_id: "",
+  pool_code: "",
   pool_name: ""
 });
 
 const setupCreateForm = reactive({
-  pool_id: "POOL_NEW",
-  pool_name: "New_Pool"
+  pool_code: "",
+  pool_name: ""
 });
 const setupStep = ref(1);
 const setupMode = ref("join");
-const setupGateName = ref("MAGI-01");
+const setupGateCode = ref("");
+const setupGateName = ref("");
+const setupGateCodeInitialized = ref(false);
 
 const pendingInput = reactive({});
 const kitNameInput = reactive({});
 
 const displayForm = reactive({
   kit_id: "",
-  msg: "WARN",
-  duration: 5000
+  skill_id: "",
+  action: "SET"
 });
 
 const formEventEditor = reactive({
   event_id: "",
-  name: "TEMP_ALERT",
+  name: "",
   enabled: true,
   cooldown_ms: 1500,
   source_kit_id: "",
@@ -91,43 +98,71 @@ const formEventEditor = reactive({
   threshold: 30,
   target_kit_id: "",
   target_skill: "",
-  message: "ALERT",
-  duration: 5000
+  action: "SET"
 });
 
 const codeEventEditor = reactive({
   event_id: "",
-  name: "CODE_EVENT",
+  name: "",
   enabled: true,
   cooldown_ms: 1500,
   code: "",
   required_keys: [],
-  fallback_enabled: true,
+  fallback_enabled: false,
   target_kit_id: "",
   target_skill: "",
-  message: "CODE ALERT",
-  duration: 5000
+  action: "SET"
+});
+
+const directActionPayload = reactive({});
+const directActionPayloadRaw = ref("{}");
+const formActionPayload = reactive({});
+const formActionPayloadRaw = ref("{}");
+const codeActionPayload = reactive({});
+const codeActionPayloadRaw = ref("{}");
+
+const gateReset = reactive({
+  challenge_code: "",
+  input_code: ""
 });
 
 const eventTemplates = ref([]);
 const codeFramework = ref("");
+const DEFAULT_CODE_SKELETON = `def evaluate(ctx):
+    # 读取输入技能值:
+    # value = ctx["get"]("KIT_001", "SKILL_TEMP", default=None)
+    # 返回结构:
+    # {"trigger": True, "actions": [{"target_kit_id":"KIT_002","target_skill":"SKILL_DISPLAY","action":"SET","payload":{"msg":"HELLO"}}]}
+    return {"trigger": False}
+`;
+
+const noticeFeed = ref([]);
+let noticeSeq = 1;
+const runtimeErrorCache = new Map();
+
+const codeSkillTool = reactive({
+  kit_id: "",
+  skill_id: ""
+});
 
 const lifecycleClasses = {
-  NEW: "border-emerald-400/80 bg-emerald-500/10 text-emerald-200 animate-pulse",
-  WORKING: "border-amber-300/80 bg-amber-400/10 text-amber-100 animate-pulse",
-  DYING: "border-rose-400/80 bg-rose-500/10 text-rose-200 animate-pulse",
-  IDLE: "border-blue-400/70 bg-blue-500/10 text-blue-100"
+  NEW: "state-new",
+  WORKING: "state-working",
+  DYING: "state-dying",
+  IDLE: "state-idle"
 };
 
 const eventClasses = {
-  LOCKED: "border-amber-400/70 bg-amber-500/10 text-amber-100",
-  WORKING: "border-blue-400/70 bg-blue-500/10 text-blue-100",
-  ERROR: "border-rose-500/80 bg-rose-500/10 text-rose-100",
-  IDLE: "border-slate-500/70 bg-slate-500/10 text-slate-200"
+  DEAD: "event-dead",
+  LOCKED: "event-locked",
+  WORKING: "event-working",
+  ERROR: "event-error",
+  IDLE: "event-idle"
 };
 
 let eventSource = null;
 let pollTimer = null;
+const ID3_PATTERN = /^[A-Z0-9]{3}$/;
 
 const isConfigured = computed(() => Boolean(snapshot.value.profile?.configured));
 
@@ -152,15 +187,88 @@ const metrics = computed(() => snapshot.value.metrics ?? {});
 const discoveredPools = computed(() => snapshot.value.discovered_pools ?? []);
 const skillGrouped = computed(() => snapshot.value.skills?.grouped ?? []);
 const skillFlat = computed(() => snapshot.value.skills?.flat ?? []);
+const inputSkillFlat = computed(() =>
+  skillFlat.value.filter((item) => item.io_type !== "output")
+);
 const onlineKits = computed(() => kits.value.filter((item) => item.status === "ONLINE"));
 
-const skillsByKit = computed(() => {
+const skillsMetaByKit = computed(() => {
   const map = {};
   for (const group of skillGrouped.value) {
-    map[group.kit_id] = (group.skills ?? []).map((item) => item.skill_id);
+    map[group.kit_id] = group.skills ?? [];
   }
   return map;
 });
+
+function normalizeCodeInput(text) {
+  return String(text || "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "")
+    .slice(0, 3);
+}
+
+function appendNoticeFeed(level, message) {
+  const text = String(message || "").trim();
+  if (!text) return;
+  noticeFeed.value.unshift({
+    id: noticeSeq++,
+    level,
+    message: text,
+    at: new Date().toISOString()
+  });
+  if (noticeFeed.value.length > 80) {
+    noticeFeed.value = noticeFeed.value.slice(0, 80);
+  }
+}
+
+function clearNoticeFeed() {
+  noticeFeed.value = [];
+  runtimeErrorCache.clear();
+}
+
+watch(notice, (value) => {
+  if (value?.trim()) appendNoticeFeed("notice", value);
+});
+
+watch(errorText, (value) => {
+  if (value?.trim()) appendNoticeFeed("error", value);
+});
+
+watch(
+  () => setupJoinForm.pool_code,
+  (value) => {
+    const normalized = normalizeCodeInput(value);
+    if (normalized !== value) setupJoinForm.pool_code = normalized;
+  }
+);
+
+watch(
+  () => setupCreateForm.pool_code,
+  (value) => {
+    const normalized = normalizeCodeInput(value);
+    if (normalized !== value) setupCreateForm.pool_code = normalized;
+  }
+);
+
+watch(setupGateCode, (value) => {
+  const normalized = normalizeCodeInput(value);
+  if (normalized !== value) setupGateCode.value = normalized;
+});
+
+watch(
+  () => snapshot.value.runtime_errors,
+  (errors) => {
+    const entries = Object.entries(errors || {});
+    for (const [key, message] of entries) {
+      const text = String(message || "").trim();
+      if (!text) continue;
+      if (runtimeErrorCache.get(key) === text) continue;
+      runtimeErrorCache.set(key, text);
+      appendNoticeFeed("error", `${key}: ${text}`);
+    }
+  },
+  { deep: true }
+);
 
 function lifecycleClass(state) {
   return lifecycleClasses[state] ?? lifecycleClasses.IDLE;
@@ -170,9 +278,199 @@ function eventClass(state) {
   return eventClasses[state] ?? eventClasses.IDLE;
 }
 
-function skillOptions(kitId) {
+function inputSkillOptions(kitId) {
   if (!kitId) return [];
-  return skillsByKit.value[kitId] ?? [];
+  return (skillsMetaByKit.value[kitId] ?? [])
+    .filter((item) => item.io_type !== "output")
+    .map((item) => item.skill_id);
+}
+
+function outputSkillOptions(kitId) {
+  if (!kitId) return [];
+  return (skillsMetaByKit.value[kitId] ?? [])
+    .filter((item) => item.io_type === "output")
+    .map((item) => item.skill_id);
+}
+
+function outputSkillActions(kitId, skillId) {
+  if (!kitId || !skillId) return ["SET"];
+  const meta = (skillsMetaByKit.value[kitId] ?? []).find(
+    (item) => item.skill_id === skillId
+  );
+  const actions = Array.isArray(meta?.actions)
+    ? meta.actions
+        .map((item) => String(item || "").trim().toUpperCase())
+        .filter(Boolean)
+    : [];
+  return actions.length ? actions : ["SET"];
+}
+
+function outputActionSpecs(kitId, skillId) {
+  if (!kitId || !skillId) return {};
+  const meta = (skillsMetaByKit.value[kitId] ?? []).find(
+    (item) => item.skill_id === skillId
+  );
+  const rawSpecs = meta?.action_specs;
+  if (!rawSpecs || typeof rawSpecs !== "object") return {};
+  const normalized = {};
+  for (const [actionName, rawFields] of Object.entries(rawSpecs)) {
+    const action = String(actionName || "").trim().toUpperCase();
+    if (!action || !Array.isArray(rawFields)) continue;
+    normalized[action] = rawFields
+      .filter((raw) => raw && typeof raw === "object")
+      .map((raw) => {
+        const type = ["string", "number", "boolean", "enum", "json"].includes(
+          String(raw.type || "").toLowerCase()
+        )
+          ? String(raw.type || "").toLowerCase()
+          : "string";
+        const options = Array.isArray(raw.options)
+          ? raw.options.map((item) => String(item)).filter(Boolean)
+          : [];
+        return {
+          key: String(raw.key || raw.name || raw.id || "").trim(),
+          label: String(raw.label || raw.key || raw.name || "").trim(),
+          type,
+          required: Boolean(raw.required),
+          default: raw.default,
+          min: typeof raw.min === "number" ? raw.min : null,
+          max: typeof raw.max === "number" ? raw.max : null,
+          options,
+          placeholder: String(raw.placeholder || "").trim()
+        };
+      })
+      .filter((field) => field.key);
+  }
+  return normalized;
+}
+
+function actionFieldsFor(kitId, skillId, action) {
+  const normalizedAction = String(action || "SET").trim().toUpperCase();
+  const specs = outputActionSpecs(kitId, skillId);
+  if (Array.isArray(specs[normalizedAction]) && specs[normalizedAction].length) {
+    return specs[normalizedAction];
+  }
+  return [];
+}
+
+function clearReactiveObject(target) {
+  for (const key of Object.keys(target)) {
+    delete target[key];
+  }
+}
+
+function syncPayloadWithFields(target, fields, existingPayload = {}) {
+  const previous = { ...target, ...existingPayload };
+  clearReactiveObject(target);
+  for (const field of fields) {
+    const key = field.key;
+    if (Object.prototype.hasOwnProperty.call(previous, key)) {
+      target[key] = previous[key];
+      continue;
+    }
+    if (Object.prototype.hasOwnProperty.call(field, "default")) {
+      target[key] = field.default;
+      continue;
+    }
+    if (field.type === "boolean") {
+      target[key] = false;
+    } else if (field.type === "json") {
+      target[key] = "{}";
+    } else if (field.type === "number") {
+      target[key] = field.min ?? 0;
+    } else {
+      target[key] = "";
+    }
+  }
+}
+
+function parsePayloadRaw(rawText, label) {
+  const text = String(rawText || "").trim();
+  if (!text) return {};
+  try {
+    const value = JSON.parse(text);
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      return value;
+    }
+    throw new Error(`${label} 必须是 JSON 对象`);
+  } catch (err) {
+    throw new Error(`${label} 解析失败: ${err.message}`);
+  }
+}
+
+function toBooleanValue(value, key) {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    const lowered = value.trim().toLowerCase();
+    if (["true", "1", "yes", "on"].includes(lowered)) return true;
+    if (["false", "0", "no", "off"].includes(lowered)) return false;
+  }
+  throw new Error(`字段 ${key} 必须是布尔值`);
+}
+
+function buildPayloadFromFields(values, fields) {
+  const payload = {};
+  for (const field of fields) {
+    const key = field.key;
+    const rawValue = values[key];
+    const empty =
+      rawValue === undefined
+      || rawValue === null
+      || (typeof rawValue === "string" && rawValue.trim() === "");
+    if (empty) {
+      if (field.required) {
+        throw new Error(`字段 ${field.label || key} 为必填项`);
+      }
+      continue;
+    }
+
+    if (field.type === "number") {
+      const num = Number(rawValue);
+      if (!Number.isFinite(num)) {
+        throw new Error(`字段 ${field.label || key} 必须是数字`);
+      }
+      if (typeof field.min === "number" && num < field.min) {
+        throw new Error(`字段 ${field.label || key} 不能小于 ${field.min}`);
+      }
+      if (typeof field.max === "number" && num > field.max) {
+        throw new Error(`字段 ${field.label || key} 不能大于 ${field.max}`);
+      }
+      payload[key] = num;
+      continue;
+    }
+
+    if (field.type === "boolean") {
+      payload[key] = toBooleanValue(rawValue, key);
+      continue;
+    }
+
+    if (field.type === "enum") {
+      const text = String(rawValue);
+      if (Array.isArray(field.options) && field.options.length && !field.options.includes(text)) {
+        throw new Error(`字段 ${field.label || key} 选项无效`);
+      }
+      payload[key] = text;
+      continue;
+    }
+
+    if (field.type === "json") {
+      if (typeof rawValue === "string") {
+        try {
+          payload[key] = JSON.parse(rawValue);
+        } catch (err) {
+          throw new Error(`字段 ${field.label || key} JSON 解析失败: ${err.message}`);
+        }
+      } else if (rawValue && typeof rawValue === "object") {
+        payload[key] = rawValue;
+      } else {
+        throw new Error(`字段 ${field.label || key} 必须是 JSON`);
+      }
+      continue;
+    }
+
+    payload[key] = String(rawValue);
+  }
+  return payload;
 }
 
 function friendlyTime(ts) {
@@ -200,26 +498,164 @@ async function apiRequest(url, options = {}) {
 }
 
 function ensureSkillSelections() {
-  const sourceOptions = skillOptions(formEventEditor.source_kit_id);
-  if (sourceOptions.length && !sourceOptions.includes(formEventEditor.source_skill)) {
-    formEventEditor.source_skill = sourceOptions[0];
+  const sourceOptions = inputSkillOptions(formEventEditor.source_kit_id);
+  if (!sourceOptions.includes(formEventEditor.source_skill)) {
+    formEventEditor.source_skill = "";
   }
-  if (!sourceOptions.length) formEventEditor.source_skill = "";
 
-  const targetOptions = skillOptions(formEventEditor.target_kit_id);
-  if (targetOptions.length && !targetOptions.includes(formEventEditor.target_skill)) {
-    formEventEditor.target_skill = targetOptions[0];
+  const targetOptions = outputSkillOptions(formEventEditor.target_kit_id);
+  if (!targetOptions.includes(formEventEditor.target_skill)) {
+    formEventEditor.target_skill = "";
   }
-  if (!targetOptions.length) formEventEditor.target_skill = "";
+  const formActions = outputSkillActions(
+    formEventEditor.target_kit_id,
+    formEventEditor.target_skill
+  );
+  formEventEditor.action = formActions.includes(formEventEditor.action)
+    ? formEventEditor.action
+    : (formActions[0] || "SET");
 
-  const codeTargetOptions = skillOptions(codeEventEditor.target_kit_id);
-  if (
-    codeTargetOptions.length &&
-    !codeTargetOptions.includes(codeEventEditor.target_skill)
-  ) {
-    codeEventEditor.target_skill = codeTargetOptions[0];
+  const codeTargetOptions = outputSkillOptions(codeEventEditor.target_kit_id);
+  if (!codeTargetOptions.includes(codeEventEditor.target_skill)) {
+    codeEventEditor.target_skill = "";
   }
-  if (!codeTargetOptions.length) codeEventEditor.target_skill = "";
+  const codeActions = outputSkillActions(
+    codeEventEditor.target_kit_id,
+    codeEventEditor.target_skill
+  );
+  codeEventEditor.action = codeActions.includes(codeEventEditor.action)
+    ? codeEventEditor.action
+    : (codeActions[0] || "SET");
+
+  const directTargetOptions = outputSkillOptions(displayForm.kit_id);
+  if (!directTargetOptions.includes(displayForm.skill_id)) {
+    displayForm.skill_id = "";
+  }
+  const directActions = outputSkillActions(displayForm.kit_id, displayForm.skill_id);
+  displayForm.action = directActions.includes(displayForm.action)
+    ? displayForm.action
+    : (directActions[0] || "SET");
+
+  syncPayloadWithFields(
+    directActionPayload,
+    actionFieldsFor(displayForm.kit_id, displayForm.skill_id, displayForm.action)
+  );
+  syncPayloadWithFields(
+    formActionPayload,
+    actionFieldsFor(
+      formEventEditor.target_kit_id,
+      formEventEditor.target_skill,
+      formEventEditor.action
+    )
+  );
+  syncPayloadWithFields(
+    codeActionPayload,
+    actionFieldsFor(
+      codeEventEditor.target_kit_id,
+      codeEventEditor.target_skill,
+      codeEventEditor.action
+    )
+  );
+}
+
+const formActionOptions = computed(() =>
+  outputSkillActions(formEventEditor.target_kit_id, formEventEditor.target_skill)
+);
+
+const codeActionOptions = computed(() =>
+  outputSkillActions(codeEventEditor.target_kit_id, codeEventEditor.target_skill)
+);
+
+const directActionOptions = computed(() =>
+  outputSkillActions(displayForm.kit_id, displayForm.skill_id)
+);
+
+const directActionFields = computed(() =>
+  actionFieldsFor(displayForm.kit_id, displayForm.skill_id, displayForm.action)
+);
+
+const formActionFields = computed(() =>
+  actionFieldsFor(
+    formEventEditor.target_kit_id,
+    formEventEditor.target_skill,
+    formEventEditor.action
+  )
+);
+
+const codeActionFields = computed(() =>
+  actionFieldsFor(
+    codeEventEditor.target_kit_id,
+    codeEventEditor.target_skill,
+    codeEventEditor.action
+  )
+);
+
+const codeToolSkills = computed(() => {
+  if (!codeSkillTool.kit_id) return [];
+  const raw = skillsMetaByKit.value[codeSkillTool.kit_id] ?? [];
+  return raw.map((item) =>
+    typeof item === "string" ? { skill_id: item, io_type: "", actions: ["SET"], action_specs: {} } : item
+  );
+});
+
+const codeToolUsage = computed(() => {
+  if (!codeSkillTool.kit_id || !codeSkillTool.skill_id) {
+    return "# 选择 KIT 与 SKILL 后显示调用示例";
+  }
+  const meta = codeToolSkills.value.find((item) => item.skill_id === codeSkillTool.skill_id);
+  if (!meta) {
+    return "# 该 SKILL 不存在";
+  }
+  if (meta.io_type !== "output") {
+    return [
+      `# Input SKILL 示例: ${codeSkillTool.kit_id}/${codeSkillTool.skill_id}`,
+      `value = ctx["get"]("${codeSkillTool.kit_id}", "${codeSkillTool.skill_id}", default=None)`,
+      "if value is None:",
+      "    return {\"trigger\": False}",
+      "",
+      "# 在你的逻辑中使用 value",
+      "return {\"trigger\": False}"
+    ].join("\n");
+  }
+
+  const actions = Array.isArray(meta.actions) && meta.actions.length ? meta.actions : ["SET"];
+  const chosenAction = actions[0];
+  const specs = meta.action_specs?.[chosenAction] ?? [];
+  const payload = {};
+  for (const field of specs) {
+    if (field.type === "number") payload[field.key] = field.default ?? 0;
+    else if (field.type === "boolean") payload[field.key] = Boolean(field.default ?? false);
+    else if (field.type === "enum") payload[field.key] = field.default ?? field.options?.[0] ?? "";
+    else if (field.type === "json") payload[field.key] = field.default ?? {};
+    else payload[field.key] = field.default ?? "";
+  }
+  const payloadText = JSON.stringify(payload, null, 4)
+    .split("\n")
+    .map((line) => (line ? `        ${line}` : ""))
+    .join("\n");
+  return [
+    `# Output SKILL 示例: ${codeSkillTool.kit_id}/${codeSkillTool.skill_id}`,
+    "return {",
+    "    \"trigger\": True,",
+    "    \"actions\": [",
+    "        {",
+    `            \"target_kit_id\": \"${codeSkillTool.kit_id}\",`,
+    `            \"target_skill\": \"${codeSkillTool.skill_id}\",`,
+    `            \"action\": \"${chosenAction}\",`,
+    `            \"payload\": ${payloadText || "{}"}`,
+    "        }",
+    "    ]",
+    "}"
+  ].join("\n");
+});
+
+function canToggleEvent(item) {
+  return item.status !== "LOCKED" && item.status !== "DEAD";
+}
+
+function setTheme(theme) {
+  uiTheme.value = theme;
+  localStorage.setItem("zc_console_theme", theme);
 }
 
 function syncFormsFromSnapshot(data) {
@@ -229,34 +665,19 @@ function syncFormsFromSnapshot(data) {
     namesForm.gate_name = data.profile?.gate_name ?? namesForm.gate_name;
   }
 
-  if (!setupJoinForm.pool_id) {
-    setupJoinForm.pool_id = data.profile?.pool_id ?? "POOL_ZC";
-    setupJoinForm.pool_name = data.profile?.pool_name ?? "ZeroCloud_Main_Pool";
-  }
-  if (!setupGateName.value) {
-    setupGateName.value = data.profile?.gate_name ?? "MAGI-01";
-  }
-
-  if (!displayForm.kit_id && data.kits?.length) {
-    displayForm.kit_id = data.kits[0].kit_id;
-  }
-  if (!formEventEditor.source_kit_id && data.kits?.length) {
-    formEventEditor.source_kit_id = data.kits[0].kit_id;
-  }
-  if (!formEventEditor.target_kit_id && data.kits?.length) {
-    formEventEditor.target_kit_id = data.kits[0].kit_id;
-  }
-  if (!codeEventEditor.target_kit_id && data.kits?.length) {
-    codeEventEditor.target_kit_id = data.kits[0].kit_id;
-  }
-
   for (const item of data.kits ?? []) {
-    if (!kitNameInput[item.kit_id]) {
+    if (!Object.prototype.hasOwnProperty.call(kitNameInput, item.kit_id)) {
       kitNameInput[item.kit_id] = item.display_name;
     }
   }
 
   if (!data.profile?.configured) {
+    const gateId = String(data.profile?.gate_id || "").toUpperCase();
+    const gateMatch = gateId.match(/^GATE_([A-Z0-9]{3})$/);
+    if (!setupGateCodeInitialized.value) {
+      setupGateCode.value = gateMatch ? gateMatch[1] : normalizeCodeInput(gateId);
+      setupGateCodeInitialized.value = true;
+    }
     activeTab.value = "setup";
   } else if (activeTab.value === "setup") {
     activeTab.value = "config";
@@ -286,8 +707,8 @@ async function loadEventMeta() {
       apiRequest("/api/v1/events/code-framework")
     ]);
     eventTemplates.value = templates.items ?? [];
-    codeFramework.value = framework.code || "";
-    if (!codeEventEditor.code) {
+    codeFramework.value = framework.code || DEFAULT_CODE_SKELETON;
+    if (!codeEventEditor.code.trim()) {
       codeEventEditor.code = codeFramework.value;
     }
   } catch (err) {
@@ -354,17 +775,19 @@ async function saveNames() {
 }
 
 function applyDiscoveredPool(item) {
-  setupJoinForm.pool_id = item.pool_id;
+  const normalizedPoolId = String(item.pool_id || "").toUpperCase();
+  const match = normalizedPoolId.match(/^POOL_([A-Z0-9]{3})$/);
+  setupJoinForm.pool_code = match ? match[1] : normalizeCodeInput(normalizedPoolId);
   setupJoinForm.pool_name = item.pool_name || item.pool_id;
 }
 
 function beginSetup(mode) {
-  if (mode === "join" && !setupJoinForm.pool_id.trim()) {
-    errorText.value = "请先选择或填写要加入的 POOL。";
+  if (mode === "join" && !ID3_PATTERN.test(normalizeCodeInput(setupJoinForm.pool_code))) {
+    errorText.value = "请输入 3 位 POOL 编号（大写字母或数字）。";
     return;
   }
-  if (mode === "create" && !setupCreateForm.pool_id.trim()) {
-    errorText.value = "请先填写新 POOL_ID。";
+  if (mode === "create" && !ID3_PATTERN.test(normalizeCodeInput(setupCreateForm.pool_code))) {
+    errorText.value = "请输入 3 位新 POOL 编号（大写字母或数字）。";
     return;
   }
   setupMode.value = mode;
@@ -379,28 +802,38 @@ async function finalizeSetup() {
   try {
     const endpoint =
       setupMode.value === "join" ? "/api/v1/setup/join" : "/api/v1/setup/create";
+    const poolCode = normalizeCodeInput(
+      setupMode.value === "join" ? setupJoinForm.pool_code : setupCreateForm.pool_code
+    );
+    const gateCode = normalizeCodeInput(setupGateCode.value);
+    if (!ID3_PATTERN.test(poolCode)) {
+      throw new Error("POOL 编号必须为 3 位大写字母或数字");
+    }
+    if (!ID3_PATTERN.test(gateCode)) {
+      throw new Error("GATE 编号必须为 3 位大写字母或数字");
+    }
     const poolPayload =
       setupMode.value === "join"
         ? {
-            pool_id: setupJoinForm.pool_id,
+            pool_id: `POOL_${poolCode}`,
             pool_name: setupJoinForm.pool_name
           }
         : {
-            pool_id: setupCreateForm.pool_id,
+            pool_id: `POOL_${poolCode}`,
             pool_name: setupCreateForm.pool_name
           };
     await apiRequest(endpoint, {
       method: "POST",
       body: JSON.stringify({
         ...poolPayload,
-        gate_id: snapshot.value.profile?.gate_id || "GATE_01",
+        gate_id: `GATE_${gateCode}`,
         gate_name: setupGateName.value
       })
     });
     notice.value =
       setupMode.value === "join"
-        ? `已绑定到 POOL ${setupJoinForm.pool_id}`
-        : `已创建并绑定 POOL ${setupCreateForm.pool_id}`;
+        ? `已绑定到 POOL_${poolCode}`
+        : `已创建并绑定 POOL_${poolCode}`;
   } catch (err) {
     errorText.value = `首次组网失败: ${err.message}`;
   } finally {
@@ -464,6 +897,13 @@ async function renameKit(kitId) {
 }
 
 async function forceDeleteKit(kitId) {
+  if (
+    !window.confirm(
+      `确认删除 ${kitId}？删除后该 KIT 会进入死亡身份，直接重连将被忽略。`
+    )
+  ) {
+    return;
+  }
   busy.delete_kit = kitId;
   notice.value = "";
   errorText.value = "";
@@ -478,21 +918,25 @@ async function forceDeleteKit(kitId) {
 }
 
 async function sendDisplay() {
-  if (!displayForm.kit_id) return;
+  if (!displayForm.kit_id || !displayForm.skill_id) return;
   busy.display_send = true;
   notice.value = "";
   errorText.value = "";
   try {
-    await apiRequest(`/api/v1/kits/${displayForm.kit_id}/display`, {
+    const payload = directActionFields.value.length
+      ? buildPayloadFromFields(directActionPayload, directActionFields.value)
+      : parsePayloadRaw(directActionPayloadRaw.value, "C2 Payload");
+    await apiRequest(`/api/v1/kits/${displayForm.kit_id}/invoke`, {
       method: "POST",
       body: JSON.stringify({
-        msg: displayForm.msg,
-        duration: Number(displayForm.duration)
+        skill_id: displayForm.skill_id,
+        action: displayForm.action,
+        payload
       })
     });
-    notice.value = `显示指令已下发到 ${displayForm.kit_id}`;
+    notice.value = `输出指令已下发到 ${displayForm.kit_id}/${displayForm.skill_id}`;
   } catch (err) {
-    errorText.value = `显示指令失败: ${err.message}`;
+    errorText.value = `输出指令失败: ${err.message}`;
   } finally {
     busy.display_send = false;
   }
@@ -514,37 +958,42 @@ async function resetKit(kitId) {
 
 function clearFormEditor() {
   formEventEditor.event_id = "";
-  formEventEditor.name = "TEMP_ALERT";
+  formEventEditor.name = "";
   formEventEditor.enabled = true;
   formEventEditor.cooldown_ms = 1500;
+  formEventEditor.source_kit_id = "";
+  formEventEditor.source_skill = "";
+  formEventEditor.target_kit_id = "";
+  formEventEditor.target_skill = "";
+  formEventEditor.action = "SET";
   formEventEditor.operator = ">";
   formEventEditor.threshold = 30;
-  formEventEditor.message = "ALERT";
-  formEventEditor.duration = 5000;
-  if (kits.value.length) {
-    formEventEditor.source_kit_id = kits.value[0].kit_id;
-    formEventEditor.target_kit_id = kits.value[0].kit_id;
-  }
+  formActionPayloadRaw.value = "{}";
+  clearReactiveObject(formActionPayload);
   ensureSkillSelections();
 }
 
 function clearCodeEditor() {
   codeEventEditor.event_id = "";
-  codeEventEditor.name = "CODE_EVENT";
+  codeEventEditor.name = "";
   codeEventEditor.enabled = true;
   codeEventEditor.cooldown_ms = 1500;
+  codeEventEditor.code = codeFramework.value || DEFAULT_CODE_SKELETON;
   codeEventEditor.required_keys = [];
-  codeEventEditor.fallback_enabled = true;
-  if (kits.value.length) {
-    codeEventEditor.target_kit_id = kits.value[0].kit_id;
-  }
+  codeEventEditor.fallback_enabled = false;
+  codeEventEditor.target_kit_id = "";
+  codeEventEditor.target_skill = "";
+  codeEventEditor.action = "SET";
+  codeActionPayloadRaw.value = "{}";
+  clearReactiveObject(codeActionPayload);
   ensureSkillSelections();
-  codeEventEditor.message = "CODE ALERT";
-  codeEventEditor.duration = 5000;
-  codeEventEditor.code = codeFramework.value || codeEventEditor.code;
 }
 
 function formEventPayload() {
+  const actionPayload = formActionFields.value.length
+    ? buildPayloadFromFields(formActionPayload, formActionFields.value)
+    : parsePayloadRaw(formActionPayloadRaw.value, "表单 ACTION Payload");
+
   return {
     name: formEventEditor.name,
     mode: "form",
@@ -559,11 +1008,8 @@ function formEventPayload() {
     action: {
       target_kit_id: formEventEditor.target_kit_id,
       target_skill: formEventEditor.target_skill,
-      action: "SET",
-      payload: {
-        msg: formEventEditor.message,
-        duration: Number(formEventEditor.duration)
-      }
+      action: formEventEditor.action,
+      payload: actionPayload
     },
     required_skills: [],
     code: ""
@@ -571,31 +1017,14 @@ function formEventPayload() {
 }
 
 function codeEventPayload() {
-  const required = codeEventEditor.required_keys.map((key) => {
-    const [kit_id, skill_id] = key.split("/");
-    return { kit_id, skill_id };
-  });
-
-  const action = codeEventEditor.fallback_enabled
-    ? {
-        target_kit_id: codeEventEditor.target_kit_id,
-        target_skill: codeEventEditor.target_skill,
-        action: "SET",
-        payload: {
-          msg: codeEventEditor.message,
-          duration: Number(codeEventEditor.duration)
-        }
-      }
-    : null;
-
   return {
     name: codeEventEditor.name,
     mode: "code",
     enabled: codeEventEditor.enabled,
     cooldown_ms: Number(codeEventEditor.cooldown_ms),
     condition: null,
-    action,
-    required_skills: required,
+    action: null,
+    required_skills: [],
     code: codeEventEditor.code
   };
 }
@@ -654,7 +1083,46 @@ async function saveCodeEvent() {
   }
 }
 
+function insertSkillUsageSnippet() {
+  if (!codeSkillTool.kit_id || !codeSkillTool.skill_id) {
+    errorText.value = "请先在 SKILL 方法查看工具中选择 KIT 和 SKILL。";
+    return;
+  }
+  const snippet = codeToolUsage.value;
+  const code = codeEventEditor.code || "";
+  codeEventEditor.code = code.trim()
+    ? `${code.trim()}\n\n${snippet}\n`
+    : `${snippet}\n`;
+  notice.value = `已插入 ${codeSkillTool.kit_id}/${codeSkillTool.skill_id} 调用示例`;
+}
+
+async function testCodeEvent() {
+  if (!codeEventEditor.code.trim()) {
+    errorText.value = "请先填写代码。";
+    return;
+  }
+  busy.test_code = true;
+  notice.value = "";
+  errorText.value = "";
+  try {
+    const result = await apiRequest("/api/v1/events/code-test", {
+      method: "POST",
+      body: JSON.stringify({ code: codeEventEditor.code })
+    });
+    if (result.ok) {
+      notice.value = `代码测试通过（phase=${result.phase}）`;
+    } else {
+      errorText.value = `代码测试失败（${result.phase}）: ${result.error}`;
+    }
+  } catch (err) {
+    errorText.value = `代码测试失败: ${err.message}`;
+  } finally {
+    busy.test_code = false;
+  }
+}
+
 async function toggleEvent(item, enabled) {
+  if (!canToggleEvent(item)) return;
   busy.toggle_event = item.event_id;
   notice.value = "";
   errorText.value = "";
@@ -685,6 +1153,71 @@ async function removeEvent(item) {
   }
 }
 
+async function requestGateResetCode() {
+  busy.gate_reset_code = true;
+  notice.value = "";
+  errorText.value = "";
+  try {
+    const result = await apiRequest("/api/v1/gate/reset/challenge", {
+      method: "POST"
+    });
+    gateReset.challenge_code = String(result.code || "");
+    gateReset.input_code = "";
+    notice.value = "已生成重置验证码，请输入后确认重置。";
+  } catch (err) {
+    errorText.value = `生成重置验证码失败: ${err.message}`;
+  } finally {
+    busy.gate_reset_code = false;
+  }
+}
+
+async function confirmGateReset() {
+  if (!gateReset.challenge_code) {
+    errorText.value = "请先生成重置验证码。";
+    return;
+  }
+  if (!gateReset.input_code.trim()) {
+    errorText.value = "请输入验证码。";
+    return;
+  }
+  if (
+    !window.confirm(
+      "将清空本 GATE 的全部配置（POOL/KIT/EVENT），并回到首次组网页面。确认继续？"
+    )
+  ) {
+    return;
+  }
+  busy.gate_reset_confirm = true;
+  notice.value = "";
+  errorText.value = "";
+  try {
+    await apiRequest("/api/v1/gate/reset/confirm", {
+      method: "POST",
+      body: JSON.stringify({ code: gateReset.input_code.trim() })
+    });
+    gateReset.challenge_code = "";
+    gateReset.input_code = "";
+    setupJoinForm.pool_code = "";
+    setupJoinForm.pool_name = "";
+    setupCreateForm.pool_code = "";
+    setupCreateForm.pool_name = "";
+    setupGateCode.value = "";
+    setupGateCodeInitialized.value = false;
+    setupGateName.value = "";
+    setupStep.value = 1;
+    activeTab.value = "setup";
+    await loadSnapshot();
+    notice.value = "本 GATE 已重置，已回到首次组网页面。";
+    setTimeout(() => {
+      window.location.reload();
+    }, 300);
+  } catch (err) {
+    errorText.value = `重置失败: ${err.message}`;
+  } finally {
+    busy.gate_reset_confirm = false;
+  }
+}
+
 function loadEventToEditor(item) {
   if (item.mode === "form") {
     eventEditorTab.value = "form";
@@ -698,8 +1231,19 @@ function loadEventToEditor(item) {
     formEventEditor.threshold = item.condition?.threshold ?? 0;
     formEventEditor.target_kit_id = item.action?.target_kit_id || "";
     formEventEditor.target_skill = item.action?.target_skill || "";
-    formEventEditor.message = item.action?.payload?.msg ?? "ALERT";
-    formEventEditor.duration = item.action?.payload?.duration ?? 5000;
+    formEventEditor.action = item.action?.action || "SET";
+    const nextFields = actionFieldsFor(
+      formEventEditor.target_kit_id,
+      formEventEditor.target_skill,
+      formEventEditor.action
+    );
+    if (nextFields.length) {
+      syncPayloadWithFields(formActionPayload, nextFields, item.action?.payload || {});
+      formActionPayloadRaw.value = "{}";
+    } else {
+      clearReactiveObject(formActionPayload);
+      formActionPayloadRaw.value = JSON.stringify(item.action?.payload || {}, null, 2);
+    }
     ensureSkillSelections();
     return;
   }
@@ -709,19 +1253,14 @@ function loadEventToEditor(item) {
   codeEventEditor.name = item.name;
   codeEventEditor.enabled = item.enabled;
   codeEventEditor.cooldown_ms = item.cooldown_ms;
-  codeEventEditor.code = item.code || codeFramework.value;
-  codeEventEditor.required_keys = (item.required_skills ?? []).map(
-    (ref) => `${ref.kit_id}/${ref.skill_id}`
-  );
-  if (item.action) {
-    codeEventEditor.fallback_enabled = true;
-    codeEventEditor.target_kit_id = item.action.target_kit_id;
-    codeEventEditor.target_skill = item.action.target_skill;
-    codeEventEditor.message = item.action.payload?.msg ?? "CODE ALERT";
-    codeEventEditor.duration = item.action.payload?.duration ?? 5000;
-  } else {
-    codeEventEditor.fallback_enabled = false;
-  }
+  codeEventEditor.code = item.code || codeFramework.value || DEFAULT_CODE_SKELETON;
+  codeEventEditor.required_keys = [];
+  codeEventEditor.fallback_enabled = false;
+  codeEventEditor.target_kit_id = "";
+  codeEventEditor.target_skill = "";
+  codeEventEditor.action = "SET";
+  clearReactiveObject(codeActionPayload);
+  codeActionPayloadRaw.value = "{}";
   ensureSkillSelections();
 }
 
@@ -735,8 +1274,20 @@ function applyTemplate(template) {
     formEventEditor.threshold = template.payload?.condition?.threshold ?? 30;
     formEventEditor.source_skill = template.payload?.condition?.source_skill ?? "";
     formEventEditor.target_skill = template.payload?.action?.target_skill ?? "";
-    formEventEditor.message = template.payload?.action?.payload?.msg ?? "ALERT";
-    formEventEditor.duration = template.payload?.action?.payload?.duration ?? 5000;
+    formEventEditor.action = template.payload?.action?.action ?? "SET";
+    const templatePayload = template.payload?.action?.payload ?? {};
+    const nextFields = actionFieldsFor(
+      formEventEditor.target_kit_id,
+      formEventEditor.target_skill,
+      formEventEditor.action
+    );
+    if (nextFields.length) {
+      syncPayloadWithFields(formActionPayload, nextFields, templatePayload);
+      formActionPayloadRaw.value = "{}";
+    } else {
+      clearReactiveObject(formActionPayload);
+      formActionPayloadRaw.value = JSON.stringify(templatePayload, null, 2);
+    }
     ensureSkillSelections();
     return;
   }
@@ -745,10 +1296,14 @@ function applyTemplate(template) {
   codeEventEditor.event_id = "";
   codeEventEditor.name = template.name;
   codeEventEditor.cooldown_ms = template.payload?.cooldown_ms ?? 1500;
-  codeEventEditor.code = template.payload?.code || codeFramework.value;
-  codeEventEditor.required_keys = (template.payload?.required_skills ?? []).map(
-    (ref) => `${ref.kit_id}/${ref.skill_id}`
-  );
+  codeEventEditor.code = template.payload?.code || codeFramework.value || DEFAULT_CODE_SKELETON;
+  codeEventEditor.action = "SET";
+  clearReactiveObject(codeActionPayload);
+  codeActionPayloadRaw.value = "{}";
+  codeEventEditor.required_keys = [];
+  codeEventEditor.fallback_enabled = false;
+  codeEventEditor.target_kit_id = "";
+  codeEventEditor.target_skill = "";
 }
 
 onMounted(async () => {
@@ -767,96 +1322,87 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <main class="min-h-screen px-4 py-5 md:px-6">
-    <header class="mx-auto mb-4 max-w-[1680px] rounded-2xl border border-magi-line bg-magi-panel/90 p-4 shadow-neon">
-      <div class="flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <h1 class="text-2xl font-semibold tracking-wide text-magi-neon">
-            🛰️ ZeroCloud · MAGI Control Console
-          </h1>
-          <p class="mt-1 text-sm text-slate-300">
+  <main :class="['metro-shell', uiTheme === 'blue' ? 'theme-blue' : 'theme-mono']">
+    <header class="metro-header">
+      <div class="metro-header-main">
+        <div class="metro-brand">
+          <h1>ZeroCloud · MAGI Console</h1>
+          <p>
             {{ snapshot.profile.pool_name }} ({{ snapshot.profile.pool_id }}) /
             {{ snapshot.profile.gate_name }} ({{ snapshot.profile.gate_id }})
           </p>
         </div>
-        <div class="flex items-center gap-2 text-xs">
-          <span
-            class="rounded-full border px-3 py-1"
-            :class="
-              metrics.mqtt_connected
-                ? 'border-emerald-400/70 bg-emerald-500/20 text-emerald-100'
-                : 'border-rose-400/70 bg-rose-500/20 text-rose-100'
-            "
-          >
+        <div class="metro-header-actions">
+          <span class="metro-pill" :class="metrics.mqtt_connected ? 'badge-online' : 'badge-offline'">
             MQTT {{ metrics.mqtt_connected ? "ONLINE" : "OFFLINE" }}
           </span>
-          <span
-            class="rounded-full border px-3 py-1"
-            :class="
-              streamConnected
-                ? 'border-blue-400/70 bg-blue-500/20 text-blue-100'
-                : 'border-amber-400/70 bg-amber-500/20 text-amber-100'
-            "
-          >
+          <span class="metro-pill" :class="streamConnected ? 'badge-live' : 'badge-fallback'">
             {{ streamConnected ? "STREAM LIVE" : "POLLING MODE" }}
           </span>
+          <button
+            v-if="isConfigured"
+            class="metro-danger-btn"
+            @click="activeTab = 'danger'"
+          >
+            重置本 GATE
+          </button>
+          <button class="metro-theme-btn" :class="{ 'is-active': uiTheme === 'blue' }" @click="setTheme('blue')">
+            Blue
+          </button>
+          <button class="metro-theme-btn" :class="{ 'is-active': uiTheme === 'mono' }" @click="setTheme('mono')">
+            Mono
+          </button>
         </div>
       </div>
 
-      <div class="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-8">
-        <div class="rounded-xl border border-magi-line bg-slate-900/40 p-3">
-          <p class="text-xs text-slate-400">TPS</p>
-          <p class="mt-1 text-xl text-magi-neon">{{ Number(metrics.frame_tps || 0).toFixed(1) }}</p>
-        </div>
-        <div class="rounded-xl border border-magi-line bg-slate-900/40 p-3">
-          <p class="text-xs text-slate-400">POOL</p>
-          <p class="mt-1 truncate text-base text-blue-100">
-            {{ snapshot.profile.pool_name || snapshot.profile.pool_id }}
-          </p>
-        </div>
-        <div class="rounded-xl border border-magi-line bg-slate-900/40 p-3">
-          <p class="text-xs text-slate-400">KITS</p>
-          <p class="mt-1 text-xl text-slate-100">{{ metrics.kits_total || 0 }}</p>
-        </div>
-        <div class="rounded-xl border border-magi-line bg-slate-900/40 p-3">
-          <p class="text-xs text-slate-400">ONLINE</p>
-          <p class="mt-1 text-xl text-magi-success">{{ metrics.kits_online || 0 }}</p>
-        </div>
-        <div class="rounded-xl border border-magi-line bg-slate-900/40 p-3">
-          <p class="text-xs text-slate-400">PENDING</p>
-          <p class="mt-1 text-xl text-magi-warn">{{ metrics.pending_total || 0 }}</p>
-        </div>
-        <div class="rounded-xl border border-magi-line bg-slate-900/40 p-3">
-          <p class="text-xs text-slate-400">EVENTS</p>
-          <p class="mt-1 text-xl text-slate-100">{{ metrics.events_total || 0 }}</p>
-        </div>
-        <div class="rounded-xl border border-magi-line bg-slate-900/40 p-3">
-          <p class="text-xs text-slate-400">LOCKED</p>
-          <p class="mt-1 text-xl text-amber-200">{{ metrics.events_locked || 0 }}</p>
-        </div>
-        <div class="rounded-xl border border-magi-line bg-slate-900/40 p-3">
-          <p class="text-xs text-slate-400">ERROR</p>
-          <p class="mt-1 text-xl text-rose-200">{{ metrics.events_error || 0 }}</p>
-        </div>
+      <div class="metro-tile-strip">
+        <article class="metro-tile metro-tile-small">
+          <p class="metro-tile-label">TPS</p>
+          <h3>{{ Number(metrics.frame_tps || 0).toFixed(1) }}</h3>
+        </article>
+        <article class="metro-tile metro-tile-pool">
+          <p class="metro-tile-label">POOL</p>
+          <h3>{{ snapshot.profile.pool_name || snapshot.profile.pool_id }}</h3>
+        </article>
+        <article class="metro-tile metro-tile-small">
+          <p class="metro-tile-label">KITS</p>
+          <h3>{{ metrics.kits_total || 0 }}</h3>
+        </article>
+        <article class="metro-tile metro-tile-small">
+          <p class="metro-tile-label">ONLINE</p>
+          <h3>{{ metrics.kits_online || 0 }}</h3>
+        </article>
+        <article class="metro-tile metro-tile-small">
+          <p class="metro-tile-label">PENDING</p>
+          <h3>{{ metrics.pending_total || 0 }}</h3>
+        </article>
+        <article class="metro-tile metro-tile-small">
+          <p class="metro-tile-label">EVENTS</p>
+          <h3>{{ metrics.events_total || 0 }}</h3>
+        </article>
+        <article class="metro-tile metro-tile-small">
+          <p class="metro-tile-label">LOCKED</p>
+          <h3>{{ metrics.events_locked || 0 }}</h3>
+        </article>
+        <article class="metro-tile metro-tile-small">
+          <p class="metro-tile-label">DEAD</p>
+          <h3>{{ metrics.events_dead || 0 }}</h3>
+        </article>
       </div>
     </header>
 
-    <nav class="mx-auto mb-4 flex max-w-[1680px] flex-wrap gap-2">
+    <nav class="metro-tabbar">
       <button
         v-for="item in visibleTabs"
         :key="item.id"
-        class="rounded-lg border px-4 py-2 text-sm transition"
-        :class="
-          activeTab === item.id
-            ? 'border-magi-neon bg-magi-neon/15 text-magi-neon'
-            : 'border-slate-600 bg-slate-900/40 text-slate-300 hover:border-magi-neon/60'
-        "
+        class="metro-tab"
+        :class="{ 'is-active': activeTab === item.id }"
         @click="activeTab = item.id"
       >
         {{ item.label }}
       </button>
       <button
-        class="rounded-lg border border-magi-neon/70 px-4 py-2 text-sm text-magi-neon transition hover:bg-magi-neon/10"
+        class="metro-tab metro-sync"
         :disabled="busy.loading"
         @click="loadSnapshot"
       >
@@ -874,7 +1420,15 @@ onBeforeUnmount(() => {
       <article v-if="setupStep === 1" class="rounded-2xl border border-magi-line bg-magi-panel/90 p-4 xl:col-span-6">
         <h2 class="text-sm font-semibold tracking-wider text-magi-neon">Step 1 · 加入已存在 POOL</h2>
         <div class="mt-3 grid gap-2">
-          <input v-model="setupJoinForm.pool_id" class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm outline-none focus:border-magi-neon" placeholder="POOL_ID" />
+          <div class="grid grid-cols-[auto,1fr] gap-2">
+            <div class="rounded-md border border-slate-600 bg-slate-900/80 px-2 py-2 text-sm text-slate-300">POOL_</div>
+            <input
+              v-model="setupJoinForm.pool_code"
+              maxlength="3"
+              class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm uppercase outline-none focus:border-magi-neon"
+              placeholder="三位编号（如 A1B）"
+            />
+          </div>
           <input v-model="setupJoinForm.pool_name" class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm outline-none focus:border-magi-neon" placeholder="POOL 名称" />
           <button class="rounded-md border border-emerald-400/70 bg-emerald-500/15 px-3 py-2 text-sm text-emerald-100 transition hover:bg-emerald-500/25" @click="beginSetup('join')">
             选择加入此 POOL
@@ -885,7 +1439,15 @@ onBeforeUnmount(() => {
       <article v-if="setupStep === 1" class="rounded-2xl border border-magi-line bg-magi-panel/90 p-4 xl:col-span-6">
         <h2 class="text-sm font-semibold tracking-wider text-magi-neon">Step 1 · 创建新 POOL</h2>
         <div class="mt-3 grid gap-2">
-          <input v-model="setupCreateForm.pool_id" class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm outline-none focus:border-magi-neon" placeholder="新 POOL_ID" />
+          <div class="grid grid-cols-[auto,1fr] gap-2">
+            <div class="rounded-md border border-slate-600 bg-slate-900/80 px-2 py-2 text-sm text-slate-300">POOL_</div>
+            <input
+              v-model="setupCreateForm.pool_code"
+              maxlength="3"
+              class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm uppercase outline-none focus:border-magi-neon"
+              placeholder="三位编号（如 1A9）"
+            />
+          </div>
           <input v-model="setupCreateForm.pool_name" class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm outline-none focus:border-magi-neon" placeholder="新 POOL 名称" />
           <button class="rounded-md border border-blue-400/70 bg-blue-500/15 px-3 py-2 text-sm text-blue-100 transition hover:bg-blue-500/25" @click="beginSetup('create')">
             选择创建此 POOL
@@ -896,6 +1458,15 @@ onBeforeUnmount(() => {
       <article v-if="setupStep === 2" class="rounded-2xl border border-magi-line bg-magi-panel/90 p-4 xl:col-span-12">
         <h2 class="text-sm font-semibold tracking-wider text-magi-neon">Step 2 · 命名 GATE</h2>
         <div class="mt-3 max-w-xl grid gap-2">
+          <div class="grid grid-cols-[auto,1fr] gap-2">
+            <div class="rounded-md border border-slate-600 bg-slate-900/80 px-2 py-2 text-sm text-slate-300">GATE_</div>
+            <input
+              v-model="setupGateCode"
+              maxlength="3"
+              class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm uppercase outline-none focus:border-magi-neon"
+              placeholder="三位编号（如 N01）"
+            />
+          </div>
           <input v-model="setupGateName" class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm outline-none focus:border-magi-neon" placeholder="GATE 名称" />
           <div class="flex flex-wrap gap-2">
             <button class="rounded-md border border-magi-neon/70 bg-magi-neon/15 px-3 py-2 text-sm text-magi-neon transition hover:bg-magi-neon/25 disabled:opacity-50" :disabled="(setupMode === 'join' && busy.setup_join) || (setupMode === 'create' && busy.setup_create)" @click="finalizeSetup">
@@ -990,6 +1561,50 @@ onBeforeUnmount(() => {
           </table>
         </div>
       </article>
+
+    </section>
+
+    <section v-if="activeTab === 'danger'" class="mx-auto grid max-w-[1680px] gap-4 xl:grid-cols-12">
+      <article class="rounded-2xl border border-rose-500/40 bg-rose-500/10 p-4 xl:col-span-12">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <h2 class="text-sm font-semibold tracking-wider text-rose-200">重置本 GATE（危险操作）</h2>
+          <button class="rounded border border-slate-400 px-2 py-1 text-xs text-slate-200" @click="activeTab = isConfigured ? 'config' : 'setup'">
+            返回
+          </button>
+        </div>
+        <p class="mt-2 text-xs text-rose-100/90">
+          将删除本 GATE 的全部配置（POOL/KIT/EVENT），并回到首次组网页面。请先生成随机验证码，再输入验证码确认。
+        </p>
+        <div class="mt-3 grid gap-2 sm:grid-cols-3">
+          <button
+            class="rounded-md border border-rose-300/70 bg-rose-500/20 px-3 py-2 text-sm text-rose-100 transition hover:bg-rose-500/30 disabled:opacity-50"
+            :disabled="busy.gate_reset_code"
+            @click="requestGateResetCode"
+          >
+            {{ busy.gate_reset_code ? "生成中..." : "生成随机验证码" }}
+          </button>
+          <input
+            :value="gateReset.challenge_code"
+            readonly
+            class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm text-amber-200 outline-none"
+            placeholder="验证码将在此显示"
+          />
+          <input
+            v-model="gateReset.input_code"
+            class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm outline-none focus:border-rose-300"
+            placeholder="输入上方验证码"
+          />
+        </div>
+        <div class="mt-2">
+          <button
+            class="rounded-md border border-rose-300/70 bg-rose-500/25 px-3 py-2 text-sm text-rose-100 transition hover:bg-rose-500/35 disabled:opacity-50"
+            :disabled="busy.gate_reset_confirm || !gateReset.challenge_code || !gateReset.input_code.trim()"
+            @click="confirmGateReset"
+          >
+            {{ busy.gate_reset_confirm ? "重置中..." : "确认重置本 GATE" }}
+          </button>
+        </div>
+      </article>
     </section>
 
     <section v-if="activeTab === 'kits'" class="mx-auto grid max-w-[1680px] gap-4 xl:grid-cols-12">
@@ -1011,18 +1626,77 @@ onBeforeUnmount(() => {
       </article>
 
       <article class="rounded-2xl border border-magi-line bg-magi-panel/90 p-4 xl:col-span-4">
-        <h2 class="text-sm font-semibold tracking-wider text-magi-neon">C2 DISPLAY 接管</h2>
+        <h2 class="text-sm font-semibold tracking-wider text-magi-neon">C2 OUTPUT 接管</h2>
         <div class="mt-3 grid gap-2">
-          <select v-model="displayForm.kit_id" class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm outline-none focus:border-magi-neon">
+          <select v-model="displayForm.kit_id" class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm outline-none focus:border-magi-neon" @change="ensureSkillSelections">
             <option disabled value="">选择在线 KIT</option>
             <option v-for="item in onlineKits" :key="item.kit_id" :value="item.kit_id">
               {{ item.display_name }} ({{ item.kit_id }})
             </option>
           </select>
-          <input v-model="displayForm.msg" maxlength="64" class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm outline-none focus:border-magi-neon" placeholder="显示文本" />
-          <input v-model.number="displayForm.duration" type="number" min="500" max="60000" class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm outline-none focus:border-magi-neon" placeholder="持续时长(ms)" />
-          <button class="rounded-md border border-emerald-400/70 bg-emerald-500/20 px-3 py-2 text-sm text-emerald-100 transition hover:bg-emerald-500/30 disabled:opacity-50" :disabled="!displayForm.kit_id || busy.display_send" @click="sendDisplay">
-            {{ busy.display_send ? "SENDING..." : "发送 DISPLAY 指令" }}
+          <select v-model="displayForm.skill_id" class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm outline-none focus:border-magi-neon" @change="ensureSkillSelections">
+            <option disabled value="">选择 Output SKILL</option>
+            <option v-for="skill in outputSkillOptions(displayForm.kit_id)" :key="`c2-skill-${skill}`" :value="skill">
+              {{ skill }}
+            </option>
+          </select>
+          <select v-model="displayForm.action" class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm outline-none focus:border-magi-neon" @change="ensureSkillSelections">
+            <option v-for="action in directActionOptions" :key="`c2-action-${action}`" :value="action">
+              {{ action }}
+            </option>
+          </select>
+          <div v-if="directActionFields.length" class="grid gap-2 sm:grid-cols-2">
+            <div v-for="field in directActionFields" :key="`c2-field-${field.key}`" class="grid gap-1">
+              <label class="text-[11px] text-slate-300">{{ field.label || field.key }}</label>
+              <input
+                v-if="field.type === 'number'"
+                v-model.number="directActionPayload[field.key]"
+                type="number"
+                :min="field.min ?? undefined"
+                :max="field.max ?? undefined"
+                class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm outline-none focus:border-magi-neon"
+                :placeholder="field.placeholder || field.key"
+              />
+              <select
+                v-else-if="field.type === 'enum'"
+                v-model="directActionPayload[field.key]"
+                class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm outline-none focus:border-magi-neon"
+              >
+                <option disabled value="">选择 {{ field.label || field.key }}</option>
+                <option v-for="item in field.options" :key="`c2-opt-${field.key}-${item}`" :value="item">{{ item }}</option>
+              </select>
+              <label
+                v-else-if="field.type === 'boolean'"
+                class="flex items-center gap-2 rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm"
+              >
+                <input type="checkbox" v-model="directActionPayload[field.key]" />
+                {{ field.label || field.key }}
+              </label>
+              <textarea
+                v-else-if="field.type === 'json'"
+                v-model="directActionPayload[field.key]"
+                rows="3"
+                class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-xs outline-none focus:border-magi-neon"
+                :placeholder="field.placeholder || 'JSON payload'"
+              />
+              <input
+                v-else
+                v-model="directActionPayload[field.key]"
+                type="text"
+                class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm outline-none focus:border-magi-neon"
+                :placeholder="field.placeholder || field.key"
+              />
+            </div>
+          </div>
+          <textarea
+            v-else
+            v-model="directActionPayloadRaw"
+            rows="4"
+            class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-xs outline-none focus:border-magi-neon"
+            placeholder='自定义 Payload JSON，例如 {"msg":"HELLO","duration":5000}'
+          />
+          <button class="rounded-md border border-emerald-400/70 bg-emerald-500/20 px-3 py-2 text-sm text-emerald-100 transition hover:bg-emerald-500/30 disabled:opacity-50" :disabled="!displayForm.kit_id || !displayForm.skill_id || busy.display_send" @click="sendDisplay">
+            {{ busy.display_send ? "SENDING..." : "发送 OUTPUT 指令" }}
           </button>
         </div>
       </article>
@@ -1052,8 +1726,8 @@ onBeforeUnmount(() => {
               <button class="rounded border border-amber-400/70 bg-amber-500/15 px-2 py-1 text-[11px] text-amber-100 transition hover:bg-amber-500/25 disabled:opacity-50" :disabled="busy.reset_kit === item.kit_id" @click="resetKit(item.kit_id)">
                 {{ busy.reset_kit === item.kit_id ? "SENDING..." : "SYS/RESET" }}
               </button>
-              <button class="rounded border border-rose-400/70 bg-rose-500/15 px-2 py-1 text-[11px] text-rose-100 transition hover:bg-rose-500/25 disabled:opacity-50" :disabled="busy.delete_kit === item.kit_id || item.status === 'ONLINE'" @click="forceDeleteKit(item.kit_id)">
-                {{ busy.delete_kit === item.kit_id ? "DELETING..." : "离线强制删除" }}
+              <button class="rounded border border-rose-400/70 bg-rose-500/15 px-2 py-1 text-[11px] text-rose-100 transition hover:bg-rose-500/25 disabled:opacity-50" :disabled="busy.delete_kit === item.kit_id" @click="forceDeleteKit(item.kit_id)">
+                {{ busy.delete_kit === item.kit_id ? "DELETING..." : "删除 KIT（强制）" }}
               </button>
             </div>
           </div>
@@ -1075,12 +1749,12 @@ onBeforeUnmount(() => {
           <input v-model="formEventEditor.name" class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm outline-none focus:border-magi-neon" placeholder="事件名称" />
           <div class="grid gap-2 sm:grid-cols-2">
             <select v-model="formEventEditor.source_kit_id" class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm outline-none focus:border-magi-neon" @change="ensureSkillSelections">
-              <option disabled value="">Source KIT</option>
+              <option disabled value="">Source KIT（原因设备）</option>
               <option v-for="item in kits" :key="`src-${item.kit_id}`" :value="item.kit_id">{{ item.display_name }} ({{ item.kit_id }})</option>
             </select>
             <select v-model="formEventEditor.source_skill" class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm outline-none focus:border-magi-neon">
-              <option disabled value="">Source SKILL</option>
-              <option v-for="skill in skillOptions(formEventEditor.source_kit_id)" :key="`src-skill-${skill}`" :value="skill">{{ skill }}</option>
+              <option disabled value="">Input SKILL（原因）</option>
+              <option v-for="skill in inputSkillOptions(formEventEditor.source_kit_id)" :key="`src-skill-${skill}`" :value="skill">{{ skill }}</option>
             </select>
           </div>
           <div class="grid gap-2 sm:grid-cols-3">
@@ -1097,17 +1771,71 @@ onBeforeUnmount(() => {
           </div>
           <div class="grid gap-2 sm:grid-cols-2">
             <select v-model="formEventEditor.target_kit_id" class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm outline-none focus:border-magi-neon" @change="ensureSkillSelections">
-              <option disabled value="">Target KIT</option>
+              <option disabled value="">Target KIT（结果设备）</option>
               <option v-for="item in kits" :key="`dst-${item.kit_id}`" :value="item.kit_id">{{ item.display_name }} ({{ item.kit_id }})</option>
             </select>
-            <select v-model="formEventEditor.target_skill" class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm outline-none focus:border-magi-neon">
-              <option disabled value="">Target SKILL</option>
-              <option v-for="skill in skillOptions(formEventEditor.target_kit_id)" :key="`dst-skill-${skill}`" :value="skill">{{ skill }}</option>
+            <select v-model="formEventEditor.target_skill" class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm outline-none focus:border-magi-neon" @change="ensureSkillSelections">
+              <option disabled value="">Output SKILL（结果）</option>
+              <option v-for="skill in outputSkillOptions(formEventEditor.target_kit_id)" :key="`dst-skill-${skill}`" :value="skill">{{ skill }}</option>
             </select>
           </div>
-          <div class="grid gap-2 sm:grid-cols-2">
-            <input v-model="formEventEditor.message" class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm outline-none focus:border-magi-neon" placeholder="消息文本" />
-            <input v-model.number="formEventEditor.duration" type="number" min="500" max="60000" class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm outline-none focus:border-magi-neon" placeholder="持续时长(ms)" />
+          <div class="grid gap-2 sm:grid-cols-3">
+            <select v-model="formEventEditor.action" class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm outline-none focus:border-magi-neon" @change="ensureSkillSelections">
+              <option v-for="action in formActionOptions" :key="`form-action-${action}`" :value="action">{{ action }}</option>
+            </select>
+            <div
+              v-if="formActionFields.length"
+              class="grid gap-2 sm:col-span-2 sm:grid-cols-2"
+            >
+              <div v-for="field in formActionFields" :key="`form-field-${field.key}`" class="grid gap-1">
+                <label class="text-[11px] text-slate-300">{{ field.label || field.key }}</label>
+                <input
+                  v-if="field.type === 'number'"
+                  v-model.number="formActionPayload[field.key]"
+                  type="number"
+                  :min="field.min ?? undefined"
+                  :max="field.max ?? undefined"
+                  class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm outline-none focus:border-magi-neon"
+                  :placeholder="field.placeholder || field.key"
+                />
+                <select
+                  v-else-if="field.type === 'enum'"
+                  v-model="formActionPayload[field.key]"
+                  class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm outline-none focus:border-magi-neon"
+                >
+                  <option disabled value="">选择 {{ field.label || field.key }}</option>
+                  <option v-for="item in field.options" :key="`form-opt-${field.key}-${item}`" :value="item">{{ item }}</option>
+                </select>
+                <label
+                  v-else-if="field.type === 'boolean'"
+                  class="flex items-center gap-2 rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm"
+                >
+                  <input type="checkbox" v-model="formActionPayload[field.key]" />
+                  {{ field.label || field.key }}
+                </label>
+                <textarea
+                  v-else-if="field.type === 'json'"
+                  v-model="formActionPayload[field.key]"
+                  rows="3"
+                  class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-xs outline-none focus:border-magi-neon"
+                  :placeholder="field.placeholder || 'JSON payload'"
+                />
+                <input
+                  v-else
+                  v-model="formActionPayload[field.key]"
+                  type="text"
+                  class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm outline-none focus:border-magi-neon"
+                  :placeholder="field.placeholder || field.key"
+                />
+              </div>
+            </div>
+            <textarea
+              v-else
+              v-model="formActionPayloadRaw"
+              rows="4"
+              class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-xs outline-none focus:border-magi-neon sm:col-span-2"
+              placeholder='自定义 Payload JSON，例如 {"value":1}'
+            />
           </div>
           <label class="flex items-center gap-2 text-xs text-slate-300"><input v-model="formEventEditor.enabled" type="checkbox" /> 启用</label>
           <div class="flex flex-wrap gap-2">
@@ -1123,37 +1851,33 @@ onBeforeUnmount(() => {
           <input v-model="codeEventEditor.name" class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm outline-none focus:border-magi-neon" placeholder="事件名称" />
           <input v-model.number="codeEventEditor.cooldown_ms" type="number" min="100" class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm outline-none focus:border-magi-neon" placeholder="冷却(ms)" />
           <label class="flex items-center gap-2 text-xs text-slate-300"><input v-model="codeEventEditor.enabled" type="checkbox" /> 启用</label>
-
           <div class="rounded-xl border border-slate-700 bg-slate-950/40 p-3">
-            <p class="mb-2 text-xs text-slate-300">依赖 SKILL（完整清单）</p>
-            <div class="grid max-h-40 grid-cols-1 gap-1 overflow-y-auto sm:grid-cols-2">
-              <label v-for="item in skillFlat" :key="`required-${item.kit_id}-${item.skill_id}`" class="flex items-center gap-2 rounded border border-slate-700 px-2 py-1 text-xs">
-                <input type="checkbox" :value="`${item.kit_id}/${item.skill_id}`" v-model="codeEventEditor.required_keys" />
-                <span>{{ item.kit_name }} / {{ item.skill_id }}</span>
-              </label>
+            <p class="mb-2 text-xs text-slate-300">SKILL 方法查看工具</p>
+            <div class="grid gap-2 sm:grid-cols-2">
+              <select v-model="codeSkillTool.kit_id" class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm outline-none focus:border-magi-neon" @change="codeSkillTool.skill_id = ''">
+                <option disabled value="">选择 KIT</option>
+                <option v-for="item in kits" :key="`tool-kit-${item.kit_id}`" :value="item.kit_id">{{ item.display_name }} ({{ item.kit_id }})</option>
+              </select>
+              <select v-model="codeSkillTool.skill_id" class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm outline-none focus:border-magi-neon">
+                <option disabled value="">选择 SKILL</option>
+                <option v-for="skill in codeToolSkills" :key="`tool-skill-${codeSkillTool.kit_id}-${skill.skill_id}`" :value="skill.skill_id">
+                  {{ skill.skill_id }} / {{ (skill.io_type || '--').toUpperCase() }}
+                </option>
+              </select>
             </div>
+            <pre class="mt-2 overflow-x-auto rounded-md border border-slate-700 bg-slate-950/80 p-2 text-[11px] text-slate-200">{{ codeToolUsage }}</pre>
+            <button class="mt-2 rounded border border-blue-400/70 bg-blue-500/20 px-2 py-1 text-xs text-blue-100 transition hover:bg-blue-500/30" @click="insertSkillUsageSnippet">
+              插入示例到代码编辑框
+            </button>
           </div>
 
-          <div class="rounded-xl border border-slate-700 bg-slate-950/40 p-3">
-            <label class="mb-2 flex items-center gap-2 text-xs text-slate-300"><input v-model="codeEventEditor.fallback_enabled" type="checkbox" /> 使用默认动作（可选）</label>
-            <div class="grid gap-2 sm:grid-cols-2" v-if="codeEventEditor.fallback_enabled">
-              <select v-model="codeEventEditor.target_kit_id" class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm outline-none focus:border-magi-neon" @change="ensureSkillSelections">
-                <option disabled value="">Target KIT</option>
-                <option v-for="item in kits" :key="`code-target-${item.kit_id}`" :value="item.kit_id">{{ item.display_name }} ({{ item.kit_id }})</option>
-              </select>
-              <select v-model="codeEventEditor.target_skill" class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm outline-none focus:border-magi-neon">
-                <option disabled value="">Target SKILL</option>
-                <option v-for="skill in skillOptions(codeEventEditor.target_kit_id)" :key="`code-target-skill-${skill}`" :value="skill">{{ skill }}</option>
-              </select>
-              <input v-model="codeEventEditor.message" class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm outline-none focus:border-magi-neon" placeholder="消息文本" />
-              <input v-model.number="codeEventEditor.duration" type="number" min="500" max="60000" class="rounded-md border border-slate-600 bg-slate-950/80 px-2 py-2 text-sm outline-none focus:border-magi-neon" placeholder="持续时长(ms)" />
-            </div>
-          </div>
-
-          <textarea v-model="codeEventEditor.code" rows="15" class="w-full rounded-md border border-slate-600 bg-slate-950/90 px-3 py-2 text-xs leading-relaxed text-slate-100 outline-none focus:border-magi-neon" placeholder="def evaluate(ctx): ..." />
+          <textarea v-model="codeEventEditor.code" rows="18" class="w-full rounded-md border border-slate-600 bg-slate-950/90 px-3 py-2 text-xs leading-relaxed text-slate-100 outline-none focus:border-magi-neon" placeholder="def evaluate(ctx): ..." />
           <div class="flex flex-wrap gap-2">
+            <button class="rounded-md border border-sky-300/70 bg-sky-500/20 px-3 py-2 text-sm text-sky-100 transition hover:bg-sky-500/30 disabled:opacity-50" :disabled="busy.test_code || !codeEventEditor.code.trim()" @click="testCodeEvent">
+              {{ busy.test_code ? "TESTING..." : "测试代码（本地编译）" }}
+            </button>
             <button class="rounded-md border border-magi-neon/70 bg-magi-neon/15 px-3 py-2 text-sm text-magi-neon transition hover:bg-magi-neon/25 disabled:opacity-50" :disabled="busy.save_code_event || !codeEventEditor.code.trim()" @click="saveCodeEvent">
-              {{ busy.save_code_event ? "SAVING..." : codeEventEditor.event_id ? "更新 EVENT" : "创建 EVENT" }}
+              {{ busy.save_code_event ? "SUBMITTING..." : codeEventEditor.event_id ? "更新并提交编译 EVENT" : "提交编译 EVENT" }}
             </button>
             <button class="rounded-md border border-slate-500 px-3 py-2 text-sm text-slate-300 transition hover:border-slate-300" @click="clearCodeEditor">清空</button>
           </div>
@@ -1193,7 +1917,8 @@ onBeforeUnmount(() => {
             <p class="mt-1 text-[11px] text-slate-300">Last Trigger: {{ friendlyTime(item.last_triggered_at) }}</p>
             <div class="mt-2 flex flex-wrap gap-2">
               <button class="rounded border border-blue-300/60 bg-blue-500/20 px-2 py-1 text-[11px] text-blue-100" @click="loadEventToEditor(item)">编辑</button>
-              <button class="rounded border border-emerald-300/60 bg-emerald-500/20 px-2 py-1 text-[11px] text-emerald-100 disabled:opacity-50" :disabled="busy.toggle_event === item.event_id" @click="toggleEvent(item, !item.enabled)">{{ item.enabled ? "停用" : "启用" }}</button>
+              <button v-if="canToggleEvent(item)" class="rounded border border-emerald-300/60 bg-emerald-500/20 px-2 py-1 text-[11px] text-emerald-100 disabled:opacity-50" :disabled="busy.toggle_event === item.event_id" @click="toggleEvent(item, !item.enabled)">{{ item.enabled ? "停用" : "启用" }}</button>
+              <span v-else class="rounded border border-slate-500/60 bg-slate-700/20 px-2 py-1 text-[11px] text-slate-300">仅可修改/删除</span>
               <button class="rounded border border-rose-300/60 bg-rose-500/20 px-2 py-1 text-[11px] text-rose-100 disabled:opacity-50" :disabled="busy.delete_event === item.event_id" @click="removeEvent(item)">删除</button>
             </div>
           </div>
@@ -1207,13 +1932,16 @@ onBeforeUnmount(() => {
         <h2 class="text-sm font-semibold tracking-wider text-magi-neon">完整 SKILL 清单</h2>
         <p class="mt-1 text-xs text-slate-400">表单模式仅能选此处已有 SKILL；代码模式建议直接复用此清单。</p>
         <div class="mt-3 overflow-x-auto">
-          <table class="w-full min-w-[960px] text-left text-xs">
+          <table class="w-full min-w-[1120px] text-left text-xs">
             <thead>
               <tr class="border-b border-slate-700 text-slate-300">
                 <th class="py-2">KIT</th>
                 <th class="py-2">KIT 名称</th>
                 <th class="py-2">状态</th>
                 <th class="py-2">SKILL</th>
+                <th class="py-2">I/O</th>
+                <th class="py-2">ACTION</th>
+                <th class="py-2">DURATION</th>
                 <th class="py-2">最近值</th>
               </tr>
             </thead>
@@ -1223,10 +1951,13 @@ onBeforeUnmount(() => {
                 <td class="py-2">{{ item.kit_name }}</td>
                 <td class="py-2">{{ item.status }}</td>
                 <td class="py-2">{{ item.skill_id }}</td>
+                <td class="py-2">{{ (item.io_type || "--").toUpperCase() }}</td>
+                <td class="py-2">{{ (item.actions || []).join(" / ") || "--" }}</td>
+                <td class="py-2">{{ item.supports_duration ? "YES" : "NO" }}</td>
                 <td class="py-2">{{ item.last_value ?? "--" }}</td>
               </tr>
               <tr v-if="!skillFlat.length">
-                <td colspan="5" class="py-3 text-slate-500">暂无 SKILL 数据</td>
+                <td colspan="8" class="py-3 text-slate-500">暂无 SKILL 数据</td>
               </tr>
             </tbody>
           </table>
@@ -1234,13 +1965,28 @@ onBeforeUnmount(() => {
       </article>
     </section>
 
-    <footer class="mx-auto mt-4 max-w-[1680px] space-y-1 rounded-xl border border-magi-line bg-slate-950/50 px-4 py-2 text-xs">
-      <p v-if="notice" class="text-emerald-200">{{ notice }}</p>
-      <p v-if="errorText" class="text-rose-200">{{ errorText }}</p>
-      <p v-for="(message, key) in snapshot.runtime_errors" :key="key" class="text-amber-200">
-        {{ key }}: {{ message }}
-      </p>
-      <p class="text-slate-500">
+    <footer class="mx-auto mt-4 max-w-[1680px] rounded-xl border border-magi-line bg-slate-950/50 px-4 py-3 text-xs">
+      <div class="flex flex-wrap items-center justify-between gap-2">
+        <p class="text-slate-300">任务通知</p>
+        <button
+          class="rounded border border-slate-500 px-2 py-1 text-[11px] text-slate-300 transition hover:border-slate-300"
+          :disabled="!noticeFeed.length"
+          @click="clearNoticeFeed"
+        >
+          清空通知
+        </button>
+      </div>
+      <div class="mt-2 max-h-48 space-y-1 overflow-y-auto">
+        <p v-if="!noticeFeed.length" class="text-slate-500">暂无通知</p>
+        <p
+          v-for="item in noticeFeed"
+          :key="item.id"
+          :class="item.level === 'error' ? 'text-rose-200' : 'text-emerald-200'"
+        >
+          [{{ friendlyTime(item.at) }}] {{ item.message }}
+        </p>
+      </div>
+      <p class="mt-2 text-slate-500">
         Revision {{ snapshot.revision }} · {{ friendlyTime(new Date().toISOString()) }}
       </p>
     </footer>

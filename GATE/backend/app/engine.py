@@ -131,10 +131,20 @@ class FrameEngine:
 
         source = self.state.kits_by_id.get(event.condition.source_kit_id)
         target = self.state.kits_by_id.get(event.action.target_kit_id)
-        if source is None or source.status != "ONLINE":
+        if source is None:
+            event.enabled = False
+            event.status = "DEAD"
+            event.lock_reason = f"Source KIT removed: {event.condition.source_kit_id}"
+            return []
+        if source.status != "ONLINE":
             self._lock_event(event, "Source KIT offline")
             return []
-        if target is None or target.status != "ONLINE":
+        if target is None:
+            event.enabled = False
+            event.status = "DEAD"
+            event.lock_reason = f"Target KIT removed: {event.action.target_kit_id}"
+            return []
+        if target.status != "ONLINE":
             self._lock_event(event, "Target KIT offline")
             return []
         if event.condition.source_skill not in source.skills:
@@ -266,7 +276,10 @@ class FrameEngine:
         for ref in event.required_skills:
             kit = self.state.kits_by_id.get(ref.kit_id)
             if kit is None:
-                raise ValueError(f"KIT {ref.kit_id} not found.")
+                event.enabled = False
+                event.status = "DEAD"
+                event.lock_reason = f"KIT removed: {ref.kit_id}"
+                return []
             if ref.skill_id not in kit.skills:
                 raise ValueError(f"SKILL {ref.skill_id} not found on KIT {ref.kit_id}.")
             if kit.status != "ONLINE":
@@ -319,18 +332,38 @@ class FrameEngine:
                 for event in self.state.events.values():
                     before = (event.status, event.lock_reason, event.last_triggered_at)
                     if not event.enabled:
-                        event.status = "IDLE"
-                        event.lock_reason = None
+                        blocked_reason = self.state._event_enable_block_reason_unlocked(event)
+                        if event.status == "DEAD":
+                            if blocked_reason and event.lock_reason != blocked_reason:
+                                event.lock_reason = blocked_reason
+                        elif blocked_reason:
+                            lowered = blocked_reason.lower()
+                            next_status = "LOCKED" if "offline" in lowered else "ERROR"
+                            if (
+                                event.status != next_status
+                                or event.lock_reason != blocked_reason
+                            ):
+                                event.status = next_status
+                                event.lock_reason = blocked_reason
+                        elif event.status != "IDLE" or event.lock_reason is not None:
+                            event.status = "IDLE"
+                            event.lock_reason = None
+                        if (event.status, event.lock_reason, event.last_triggered_at) != before:
+                            changed = True
+                        continue
+
+                    if event.status == "DEAD":
                         if (event.status, event.lock_reason, event.last_triggered_at) != before:
                             changed = True
                         continue
 
                     try:
-                        if event.mode == "form":
+                        mode = str(event.mode).strip().lower()
+                        if mode == "form":
                             commands.extend(
                                 self._evaluate_form_event_unlocked(event, now_ts)
                             )
-                        elif event.mode == "code":
+                        elif mode == "code":
                             commands.extend(
                                 self._evaluate_code_event_unlocked(event, now_ts)
                             )

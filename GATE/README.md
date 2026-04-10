@@ -1,4 +1,4 @@
-# ZeroCloud GATE (MAGI v3.1)
+# ZeroCloud GATE (MAGI v3.2 / Alpha_260410)
 
 这是按你的 POOL-GATE-KIT 文档与 ESP32-C6 协议升级后的 **Python-first** 版本：
 
